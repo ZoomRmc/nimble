@@ -1,4 +1,4 @@
-# Copyright (C) Dominik Picheta. All rights reserved.
+# Copyright (C) the Nimble contributors. All rights reserved.
 # BSD License. Look at license.txt for more info.
 
 {.used.}
@@ -25,6 +25,15 @@ suite "test command":
       check outp.processOutput.inLines("First test")
       check outp.processOutput.inLines("Failing Second test")
       check(not outp.processOutput.inLines("Third test"))
+
+  test "Continues after a failed test and returns failure":
+    cd "testCommand/testsFail":
+      let (outp, exitCode) = execNimble("test", "-c")
+      check exitCode == QuitFailure
+      check outp.processOutput.inLines("First test")
+      check outp.processOutput.inLines("Failing Second test")
+      check outp.processOutput.inLines("Third test")
+      check outp.processOutput.inLines("Only 2/3 tests files passed")
 
   test "test command can be overridden":
     cd "testCommand/testOverride":

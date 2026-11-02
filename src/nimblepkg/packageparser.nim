@@ -85,11 +85,14 @@ proc validatePackageName*(name: string) =
       "\"$1\" is an invalid package name: reserved name" % name, false)
 
 proc validateVersion*(ver: string) =
+  # Allow the full semver charset: digits and '.' for the release, plus '-'
+  # (pre-release), '+' (build metadata) and alphanumerics for their identifiers
+  # (e.g. `1.0.0-rc1`). This mirrors what newVersion and parseVersionRange accept.
   for c in ver:
-    if c notin ({'.'} + Digits):
+    if c notin ({'.', '-', '+'} + Digits + Letters):
       raise validationError(
-          "Version may only consist of numbers and the '.' character " &
-          "but found '" & c & "'.", false)
+          "Version may only consist of numbers, letters and the '.', '-', '+' " &
+          "characters but found '" & c & "'.", false)
 
 proc validatePackageInfo(pkgInfo: PackageInfo, options: Options) =
   let path = pkgInfo.myPath
@@ -238,6 +241,11 @@ proc readPackageInfoFromNimble(path: string; result: var PackageInfo) =
                 result.taskRequires[task].add(parseRequires(v.strip))
             else:
               raise nimbleError("Invalid field: " & ev.key)
+        of "features":
+          if ev.key notin result.features:
+            result.features[ev.key] = @[]
+          if ev.value.len > 0:
+            result.features[ev.key].add(parseRequires(ev.value))
         else:
           raise nimbleError(
               "Invalid section: " & currentSection)
@@ -290,6 +298,13 @@ proc readPackageInfo(pkgInfo: var PackageInfo, nf: NimbleFile, options: Options,
   pkgInfo = initPackageInfo(options, nf)
   if not nf.startsWith(options.getPkgsDir):
     pkgInfo.source = psDevelop
+  else:
+    # A .nimble file under pkgs2 belongs to an installed package. Mark it so
+    # getRealDir() does not append srcDir (installed packages have their sources
+    # at the package root). Without this, a package read straight from the cache
+    # (e.g. packageExists on a commit-pinned dep already downloaded) is left as
+    # psLocal and its --path wrongly points at a non-existent srcDir subdir.
+    pkgInfo.source = psInstalled
 
   validatePackageName(nf.splitFile.name)
 
@@ -311,6 +326,9 @@ proc readPackageInfo(pkgInfo: var PackageInfo, nf: NimbleFile, options: Options,
       try:
         readPackageInfoFromNims(nimBin, nf, options, pkgInfo)
         pkgInfo.isNimScript = true
+      except NeedsNimBinError as exc:
+        # Preserve the signal used by callers to resolve a compiler lazily.
+        raise exc
       except NimbleError as exc:
         if exc.hint.len > 0:
           raise exc

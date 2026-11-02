@@ -1,5 +1,56 @@
-import std/[strscans, os, strutils, strformat, options]
-import version, cli, common, options
+import std/[strscans, strutils, strformat, options]
+
+import version, cli, common, options, download
+import compat/os
+
+import chronos
+
+const nimBuildConfigUrl =
+  "https://raw.githubusercontent.com/nim-lang/Nim/v$1/config/build_config.txt"
+
+type CsourcesInfo* = object
+  ## Pinned csources information sourced from Nim's `config/build_config.txt`
+  ## at the matching version tag. Mirrors the four fields Nim's own
+  ## `build_all.sh` reads to bootstrap reproducibly.
+  dir*: string     ## e.g. "csources_v2" or "csources_v3"
+  url*: string     ## git URL
+  branch*: string  ## tracking branch (almost always "master")
+  hash*: string    ## exact commit Nim was bootstrapped against
+
+proc getCsourcesInfoForNim*(version: Version): Future[Option[CsourcesInfo]] {.async.} =
+  ## Fetches the pinned csources info for the given Nim version from
+  ## Nim's `config/build_config.txt` (the same file Nim's own
+  ## `build_all.sh` reads). Returns `none` if the version tag has no
+  ## build_config.txt (older Nim versions or non-existent tags) or if
+  ## the network request fails.
+  ##
+  ## This is the authoritative way to bootstrap Nim from source: each
+  ## tagged Nim release pins the csources commit it was built against.
+  ## Using csources HEAD instead drifts and breaks the bootstrap with
+  ## errors like `system module needs: raiseIndexError2`.
+  try:
+    let content = await retrieveUrl(nimBuildConfigUrl % $version)
+    var info = CsourcesInfo()
+    for rawLine in content.splitLines:
+      let line = rawLine.strip
+      if line.len == 0 or line.startsWith("#"): continue
+      let eq = line.find('=')
+      if eq <= 0: continue
+      let key = line[0 ..< eq].strip
+      var val = line[eq + 1 .. ^1].strip
+      if val.len >= 2 and val[0] == '"' and val[^1] == '"':
+        val = val[1 ..< ^1]
+      case key
+      of "nim_csourcesDir": info.dir = val
+      of "nim_csourcesUrl": info.url = val
+      of "nim_csourcesBranch": info.branch = val
+      of "nim_csourcesHash": info.hash = val
+      else: discard
+    if info.hash.len == 0:
+      return none(CsourcesInfo)
+    return some(info)
+  except CatchableError:
+    return none(CsourcesInfo)
 
 when defined(windows):
   const
@@ -20,11 +71,31 @@ proc infoAboutActivation(nimDest, nimVersion: string) =
   else:
     display("Info", nimDest & "installed; activate with 'source nim-" & nimVersion & "activate.sh'")
 
-proc compileNim*(options: Options, nimDest: string, v: VersionRange) =
+proc ensureNimBootstrapSupported*() =
+  ## Revisit once an illumos-capable release and its csources chain are available.
+  when defined(illumos):
+    raise nimbleError(
+      "Automatic Nim source bootstrapping is not yet supported on illumos. " &
+        "Use an already-built illumos-capable Nim compiler on PATH, or select it " &
+        "with --nim:<path> --useSystemNim. Released Nim versions predate illumos support.")
+
+proc getCsourcesBuildCommand*(): string =
+  when defined(windows):
+    return "build.bat"
+  else:
+    # illumos and BSD system make is not GNU make. Use gmake instead of make.
+    let makeExe = when defined(illumos) or defined(bsd): findExe("gmake") else: findExe("make")
+    if makeExe.len == 0:
+      return "sh build.sh"
+    return makeExe.quoteShell
+
+proc compileNim*(options: Options, nimDest: string, v: VersionRange) {.async.} =
   #Most of the time we dont need to recompile, if we can get the nim version from the binary . 
   let nimCompVersion = getNimVersionFromBin(nimDest / "bin" / "nim".addFileExt(ExeExt))
   if nimCompVersion.isSome() and nimCompVersion.get.withinRange(v):
     return
+
+  ensureNimBootstrapSupported()
 
   let keepCsources = true # SAT Solver uses a cache instead of a temp dir for downloads
   template exec(command: string) =
@@ -47,9 +118,18 @@ proc compileNim*(options: Options, nimDest: string, v: VersionRange) =
     if not scanf($nimVersion, "$i.$i.$i", major, minor, patch):
       display("Error", "cannot parse version requirement", Error)
       return
+  # Authoritative csources info from Nim's own `config/build_config.txt`
+  # at the matching tag. Pinning to the recorded commit is required for
+  # source bootstraps to succeed reproducibly — csources HEAD drifts away
+  # from older Nim sources and produces errors like
+  # `system module needs: raiseIndexError2`.
+  let pinned =
+    if nimVersion.isSpecial: none(CsourcesInfo)
+    else: await getCsourcesInfoForNim(nimVersion)
   let csourcesVersion =
-    #TODO We could test special against the special version-x branch to get the right csources
-    if nimVersion.isSpecial or major >= 2 and minor >= 2:
+    if pinned.isSome:
+      pinned.get.dir
+    elif nimVersion.isSpecial or major >= 2 and minor >= 2:
       # devel and 2.2+ need csources_v3
       "csources_v3"
     elif (major == 1 and minor >= 9) or major >= 2:
@@ -61,22 +141,21 @@ proc compileNim*(options: Options, nimDest: string, v: VersionRange) =
       "csources_v1"
   cd workspace:
     if not dirExists(csourcesVersion):
-      exec "git clone https://github.com/nim-lang/" & csourcesVersion
+      let cloneUrl =
+        if pinned.isSome: pinned.get.url
+        else: "https://github.com/nim-lang/" & csourcesVersion
+      exec "git clone " & cloneUrl
+    if pinned.isSome:
+      cd csourcesVersion:
+        # `git fetch origin <sha>` then checkout — handles the case where
+        # the pinned commit isn't on the default branch's recent history.
+        exec "git fetch --quiet origin " & pinned.get.hash
+        exec "git checkout --quiet " & pinned.get.hash
 
   var csourcesSucceed = false
   if canUseCsources:
     cd workspace / csourcesVersion:
-      when defined(windows):
-        let cmd = "build.bat"
-        csourcesSucceed = os.execShellCmd(cmd) == 0
-      else:
-        let makeExe = findExe("make")
-        if makeExe.len == 0:
-          let cmd = "sh build.sh"
-          csourcesSucceed = os.execShellCmd(cmd) == 0
-        else:
-          let cmd = "make"
-          csourcesSucceed = os.execShellCmd(cmd) == 0
+      csourcesSucceed = os.execShellCmd(getCsourcesBuildCommand()) == 0
 
   cd nimDest:
     #Sometimes building from csources fails and we cant do much about it. So we fallback to the slow build_all method
@@ -117,15 +196,14 @@ proc useNimFromDir*(options: var Options, realDir: string, v: VersionRange, tryC
 
   if not fileExists(nim):
     if tryCompiling and options.prompt("Develop version of nim was found but it is not compiled. Compile it now?"):
-      compileNim(options, realDir, v)
+      waitFor compileNim(options, realDir, v)
     else:
       raise nimbleError("Trying to use nim from $1 " % realDir,
                         "If you are using develop mode nim make sure to compile it.")
 
   options.nimBin = some makeNimBin(options, nim)
-  let separator = when defined(windows): ";" else: ":"
 
-  putEnv("PATH", realDir / "bin" & separator & getEnv("PATH"))
+  prependNimBinDirToPath(realDir / "bin")
   if fileExists:
     display("Info:", "switching to $1 for compilation" % options.nim, priority = HighPriority)
   else:

@@ -1,9 +1,10 @@
 {.used.}
 import unittest
 import testscommon
-import std/[options, tables, sequtils, os, strutils]
+import std/[options, tables, sequtils, os, strutils, sets]
+import chronos
 import
-  nimblepkg/[packageinfotypes, version, options, config, declarativeparser, versiondiscovery, cli, common]
+  nimblepkg/[packageinfotypes, packageinfo, version, options, config, declarativeparser, versiondiscovery, cli, common, packageparser]
 
 proc getNimbleFileFromPkgNameHelper(pkgName: string, ver = VersionRange(kind: verAny)): string =
   let pv: PkgTuple = (pkgName, ver)
@@ -17,34 +18,100 @@ proc getNimbleFileFromPkgNameHelper(pkgName: string, ver = VersionRange(kind: ve
         "https://nim-lang.org/nimble/packages.json",
       ],
   )
-  options.pkgCachePath = "./nimbleDir/pkgcache"
+  options.pkgCachePath = installDir / "pkgcache"
   let pkgInfo = downloadPkInfoForPv(pv, options, nimBin = some("nim"))
   pkgInfo.myPath
 
 suite "Declarative parsing":
   setup:
-    removeDir("nimbleDir")
+    removeDir(installDir)
 
   test "should parse requires from a nimble file":
+    # The latest nimlangserver release changes its dependencies over time, so
+    # rather than listing them the test checks the declarative parser finds the
+    # same ones as evaluating the nimble file with NimScript.
     let nimbleFile = getNimbleFileFromPkgNameHelper("nimlangserver")
     var options = initOptions()
     let nimbleFileInfo = extractRequiresInfo(nimbleFile, options)
     var activeFeatures = initTable[PkgTuple, seq[string]]()
     let requires = nimbleFileInfo.getRequires(activeFeatures)
+    let vmRequires = getPkgInfoVm(nimbleFile.parentDir, options, some("nim")).requires
 
-    let expectedPkgs =
-      @["nim", "json_rpc", "with", "chronicles", "serialization", "stew", "regex"]
-    for pkg in expectedPkgs:
-      check pkg in requires.mapIt(it[0])
+    check "nim" in requires.mapIt(it.name)
+    check requires == vmRequires
   
+  test "should not split dependency feature lists on commas (#1832)":
+    let content = """
+version = "0.1.0"
+requires "figdraw[siwin, sharedlib, harfbuzz] >= 0.35.2"
+requires "sigils >= 0.27.4[sigNameAsString,closures,siwin,chronos]"
+requires "plaindep, otherdep"
+"""
+    var options = initOptions()
+    let nimbleFileInfo = extractRequiresInfoFromContent(content, options)
+    var activeFeatures = initTable[PkgTuple, seq[string]]()
+    let requires = nimbleFileInfo.getRequires(activeFeatures)
+    check requires.mapIt(it.name) == @["figdraw", "sigils", "plaindep", "otherdep"]
+    check activeFeatures.len == 2
+    if requires.len == 4:
+      check requires[0].ver == parseVersionRange(">= 0.35.2")
+      check requires[1].ver == parseVersionRange(">= 0.27.4")
+      check activeFeatures.getOrDefault(requires[0]) ==
+        @["siwin", "sharedlib", "harfbuzz"]
+      check activeFeatures.getOrDefault(requires[1]) ==
+        @["sigNameAsString", "closures", "siwin", "chronos"]
+
+  test "minimal package info retains feature dependencies":
+    let content = """
+version = "0.35.2"
+feature "harfbuzz":
+  requires "harfbuzzy >= 0.3.0"
+"""
+    var options = initOptions()
+    let pkgInfo = getMinimalInfoFromContent(
+      content, "figdraw", newVersion("0.0.0"), "", options)
+
+    check pkgInfo.isSome
+    if pkgInfo.isSome:
+      check pkgInfo.get.features.hasKey("harfbuzz")
+      if pkgInfo.get.features.hasKey("harfbuzz"):
+        let featureRequires = pkgInfo.get.features["harfbuzz"]
+        check featureRequires.len == 1
+        if featureRequires.len == 1:
+          check featureRequires[0].name == "harfbuzzy"
+          check featureRequires[0].ver == parseVersionRange(">= 0.3.0")
+
   test "should detect nested requires and fail":
     let nimbleFile = getNimbleFileFromPkgNameHelper("jester")
     var options = initOptions()
     let nimbleFileInfo = extractRequiresInfo(nimbleFile, options)
 
     check nimbleFileInfo.nestedRequires
-  
-  
+
+  test "an INI-format nimble file is read by the INI reader":
+    # pragmagic/uuids, which nim-raft requires, still has one. Read as Nim it
+    # has no version, so installing it failed with "wanted >= 0.1.11 got .",
+    # and `Requires:` lines were skipped altogether.
+    let dir = getTempDir() / "nimble_ini_format"
+    createDir(dir)
+    defer: removeDir(dir)
+    writeFile(dir / "uuids.nimble", """
+[Package]
+name = "uuids"
+version: "0.1.12"
+author: "Xored Software, Inc."
+description: "UUID library"
+license: "MIT"
+
+[Deps]
+Requires: "nim >= 1.0, isaac >= 0.1.3"
+""")
+    var options = initOptions()
+    check not isParsableByDeclarative(readFile(dir / "uuids.nimble"), options)
+    let pkgInfo = getPkgInfo(dir, options, none(string), pikRequires)
+    check pkgInfo.basicInfo.version == newVersion("0.1.12")
+    check pkgInfo.requires.mapIt(it.name) == @["nim", "isaac"]
+
   test "should parse bin from a nimble file":
     let nimbleFile = getNimbleFileFromPkgNameHelper("nimlangserver")
     var options = initOptions()
@@ -66,7 +133,7 @@ suite "Declarative parsing":
           "https://nim-lang.org/nimble/packages.json",
         ],
     )
-    options.pkgCachePath = "./nimbleDir/pkgcache"
+    options.pkgCachePath = installDir / "pkgcache"
     options.noColor = true
     options.verbosity = DebugPriority
     options.localDeps = false
@@ -77,8 +144,8 @@ suite "Declarative parsing":
       #This is just to setup the test. We need a git dir to work on
     let repoDir = downloadRes.dir
     let downloadMethod = DownloadMethod git
-    let packageVersions = getPackageMinimalVersionsFromRepo(
-      repoDir, pv, downloadRes.version, downloadMethod, options, nimBin = some("nim")
+    let packageVersions = waitFor getPackageMinimalVersionsFromRepo(
+      repoDir, pv, downloadMethod, options, nimBin = some("nim")
     )
 
     #we know these versions are available
@@ -99,6 +166,31 @@ suite "Declarative parsing":
     for ver in versions:
       let nimbleFile = getNimbleFileFromPkgNameHelper("nim", parseVersionRange(ver))
       check extractNimVersion(nimbleFile) == ver
+
+  test "develop package read by the declarative parser seeds specialVersions with its version":
+    # A develop-mode package (nimble file NOT under pkgsDir) read via the declarative
+    # parser must seed metaData.specialVersions with its ordinary version, upholding the
+    # invariant withinRange(pkgInfo, range) relies on ("the ordinary version is always
+    # added to the special versions set"). The legacy reader does this; the declarative
+    # one did not, so any concrete version range on a develop dep was a false negative.
+    let testDir = "test_develop_specialversions"
+    removeDir(testDir)
+    createDir(testDir)
+    writeFile(testDir / "pkgdev.nimble", """
+version = "0.2.0"
+author = "test"
+description = "develop package"
+license = "MIT"
+
+requires "nim"
+""")
+    var options = initOptions()
+    options.nimBin = some options.makeNimBin("nim")
+    let pkgInfo = getPkgInfo(testDir, options, nimBin = some("nim"), level = pikRequires)
+    check pkgInfo.basicInfo.version == newVersion("0.2.0")
+    check pkgInfo.basicInfo.version in pkgInfo.metaData.specialVersions
+    check withinRange(pkgInfo, parseVersionRange(">= 0.2.0"))
+    removeDir(testDir)
 
 suite "Declarative parser features":
   test "should be able to parse features from a nimble file":
@@ -343,6 +435,141 @@ requires "nim >= 1.6.0"
     let nimbleFileInfo = extractRequiresInfoFromContent(content, options)
     check nimbleFileInfo.paths.len == 0
 
+suite "Declarative parser style insensitivity":
+  test "should parse snake_case src_dir as srcDir (#1779)":
+    let content = """
+version = "0.1.0"
+author = "test"
+description = "Test package"
+license = "MIT"
+src_dir = "src"
+
+requires "nim >= 1.6.0"
+"""
+    var options = initOptions()
+    let nimbleFileInfo = extractRequiresInfoFromContent(content, options)
+    check nimbleFileInfo.srcDir == "src"
+
+  test "should parse camelCase binDir (#1779)":
+    let content = """
+version = "0.1.0"
+binDir = "bin"
+requires "nim >= 1.6.0"
+"""
+    var options = initOptions()
+    let nimbleFileInfo = extractRequiresInfoFromContent(content, options)
+    check nimbleFileInfo.binDir == "bin"
+
+  test "should parse snake_case bin_dir as binDir (#1779)":
+    let content = """
+version = "0.1.0"
+bin_dir = "bin"
+requires "nim >= 1.6.0"
+"""
+    var options = initOptions()
+    let nimbleFileInfo = extractRequiresInfoFromContent(content, options)
+    check nimbleFileInfo.binDir == "bin"
+
+  test "should parse every assignment field in snake_case (#1779)":
+    # Exercises all style-insensitive assignment fields the declarative parser
+    # reads: srcDir, binDir, version, bin, paths.
+    let content = """
+ver_sion = "0.2.0"
+src_dir = "source"
+bin_dir = "binaries"
+paths = @["p1", "p2"]
+bin = @["app"]
+
+requires "nim >= 1.6.0"
+"""
+    var options = initOptions()
+    let nimbleFileInfo = extractRequiresInfoFromContent(content, options)
+    check nimbleFileInfo.version == "0.2.0"
+    check nimbleFileInfo.srcDir == "source"
+    check nimbleFileInfo.binDir == "binaries"
+    check nimbleFileInfo.paths == @["p1", "p2"]
+    when defined(windows):
+      check "app.exe" in nimbleFileInfo.bin
+    else:
+      check "app" in nimbleFileInfo.bin
+
+  test "snake_case old-style metadata call is not flagged as a side effect (#1779)":
+    # Call-form (rather than assignment) metadata written in snake_case must be
+    # recognised as a safe op, not misclassified as a state-modifying call.
+    let content = """
+version "0.1.0"
+src_dir "src"
+bin_dir "bin"
+skip_dirs "tests"
+"""
+    check contentHasStateModifyingOps(content) == false
+
+  test "taskRequires in any spelling sends the root package to the VM parser (#1889)":
+    # Nim reads `taskrequires` and `task_requires` as `taskRequires`. Only the
+    # VM parser reads task requirements, so the root package has to go there
+    # for every spelling; otherwise the task's dependencies are silently
+    # dropped. A dependency's task requirements are never used, so it doesn't.
+    var options = initOptions()
+    for spelling in ["taskRequires", "taskrequires", "task_requires"]:
+      let content = """
+version = "0.1.0"
+requires "nim >= 1.6.0"
+$1 "clitest", "cligen"
+""" % spelling
+      checkpoint spelling
+      let nimbleFileInfo = extractRequiresInfoFromContent(content, options)
+      check nfiTaskRequires in nimbleFileInfo.issues
+      check nimbleFileInfo.requiresVmFallback(readTaskRequires = true)
+      check not nimbleFileInfo.requiresVmFallback()
+      check isParsableByDeclarative(content, options)
+
+  test "a dependency with taskRequires is read without the VM parser (#1889)":
+    let testDir = "test_dep_task_requires"
+    removeDir(testDir)
+    createDir(testDir)
+    defer: removeDir(testDir)
+    writeFile(testDir / "deptask.nimble", """
+version = "0.1.0"
+author = "test"
+description = "dependency with task requirements"
+license = "MIT"
+
+requires "stew"
+taskRequires "test", "unittest2"
+""")
+    var options = initOptions()
+    # No Nim binary, so going to the VM would raise.
+    let pkgInfo = getPkgInfo(testDir, options, nimBin = none(string), level = pikRequires)
+    check pkgInfo.requires.mapIt(it.name) == @["stew"]
+    expect NeedsNimBinError:
+      discard getPkgInfo(testDir, options, nimBin = none(string), level = pikRequires,
+                         readTaskRequires = true)
+
+  test "a call spelled another way Nim allows falls back to the VM parser (#1889)":
+    # The declarative parser only reads the exact spelling. Any other spelling
+    # is left to the VM rather than silently dropped.
+    var options = initOptions()
+    for content in ["""
+version = "0.1.0"
+re_quires "nim >= 1.6.0"
+""", """
+version = "0.1.0"
+foreigndep "openssl"
+""", """
+version = "0.1.0"
+feature "ssl":
+  requireS "bearssl"
+"""]:
+      checkpoint content
+      let nimbleFileInfo = extractRequiresInfoFromContent(content, options)
+      check nfiNestedRequires in nimbleFileInfo.issues
+      check not isParsableByDeclarative(content, options)
+
+  test "should build a package that uses snake_case src_dir (#1779)":
+    cd "buildInstall/snakecasefields":
+      let (_, exitCode) = execNimbleYes("build")
+      check exitCode == QuitSuccess
+
 suite "isParsableByDeclarative":
   test "should return true for simple nimble content":
     let content = """
@@ -407,6 +634,122 @@ else:
 """
     var options = initOptions()
     check isParsableByDeclarative(content, options) == false
+
+  test "non-literal version flags nfiNonLiteralVersion, not a hard error":
+    # Real beacon_chain.nimble shape: `version` is an identifier imported from
+    # another module (a computed const). The declarative parser can't resolve it
+    # without running code, so it records a distinct issue (nfiNonLiteralVersion)
+    # that routes the file to the VM parser 
+    let content = """
+mode = ScriptMode.Verbose
+
+import
+  beacon_chain/version as ver
+
+packageName   = "beacon_chain"
+version       = versionAsStr
+author        = "Status Research & Development GmbH"
+description   = "Eth2.0 research implementation of the beacon chain"
+license       = "MIT or Apache License 2.0"
+
+requires "nim >= 1.6.0"
+requires "chronos"
+"""
+    var options = initOptions()
+    let info = extractRequiresInfoFromContent(content, options)
+    check nfiNonLiteralVersion in info.issues   # the distinct issue for this case
+    check nfiNestedRequires notin info.issues   # not conflated with nested requires
+    check info.requiresVmFallback               # routes to the VM parser
+    check not info.hasErrors                    # but NOT a hard parse error
+    var activeFeatures = initTable[PkgTuple, seq[string]]()
+    let reqs = info.getRequires(activeFeatures)
+    check reqs.anyIt(it.name == "chronos")
+    # Not parseable by the declarative path alone -> routes to the VM fallback.
+    check isParsableByDeclarative(content, options) == false
+
+  test "non-literal version: VM fallback computes the real version":
+    let testDir = "test_nonliteral_version"
+    removeDir(testDir)
+    createDir(testDir / "pkgnlv")
+    writeFile(testDir / "pkgnlv" / "buildver.nim", "const pkgVersion* = \"0.5.0\"\n")
+    writeFile(testDir / "pkgnlv.nimble", """
+import pkgnlv/buildver
+version       = pkgVersion
+author        = "test"
+description   = "non-literal version package"
+license       = "MIT"
+
+requires "nim"
+""")
+    var options = initOptions()
+    options.nimBin = some options.makeNimBin("nim")
+    let pkgInfo = getPkgInfo(testDir, options, nimBin = some("nim"), level = pikRequires)
+    check pkgInfo.basicInfo.version == newVersion("0.5.0")
+    removeDir(testDir)
+
+  test "VM fallback evaluates non-literal requires":
+    let testDir = "test_vm_fallback_requires"
+    removeDir(testDir)
+    createDir(testDir)
+    writeFile(testDir / "pkgrequires.nimble", """
+version = "0.1.0"
+author = "test"
+description = "VM fallback requires"
+license = "MIT"
+
+let suffix = "_dependency"
+when defined(js):
+  requires "js" & suffix
+else:
+  requires "other" & suffix
+""")
+    var options = initOptions()
+    options.nimBin = some options.makeNimBin("nim")
+    let pkgInfo = getPkgInfo(testDir, options, nimBin = some("nim"), level = pikRequires)
+    let expected = when defined(js): "js_dependency" else: "other_dependency"
+    check pkgInfo.requires.mapIt(it.name) == @[expected]
+    removeDir(testDir)
+
+  test "VM fallback evaluates requires inside templates":
+    let testDir = "test_vm_fallback_template_requires"
+    removeDir(testDir)
+    createDir(testDir)
+    writeFile(testDir / "pkgtemplate.nimble", """
+version = "0.1.0"
+author = "test"
+description = "VM fallback template requires"
+license = "MIT"
+
+template addDependency(name: string) =
+  requires name
+
+addDependency "template_dependency"
+""")
+    var options = initOptions()
+    options.nimBin = some options.makeNimBin("nim")
+    let pkgInfo = getPkgInfo(testDir, options, nimBin = some("nim"), level = pikRequires)
+    check pkgInfo.requires.mapIt(it.name) == @["template_dependency"]
+    removeDir(testDir)
+
+  test "VM fallback preserves evaluated paths":
+    let testDir = "test_vm_fallback_paths"
+    removeDir(testDir)
+    createDir(testDir)
+    writeFile(testDir / "pkgpaths.nimble", """
+version = "0.5.0"
+author = "test"
+description = "VM fallback paths"
+license = "MIT"
+let dependencyPath = "lib"
+paths = @[dependencyPath]
+requires "nim"
+""")
+    createDir(testDir / "lib")
+    var options = initOptions()
+    options.nimBin = some options.makeNimBin("nim")
+    let pkgInfo = getPkgInfo(testDir, options, nimBin = some("nim"), level = pikRequires)
+    check pkgInfo.paths == @["lib"]
+    removeDir(testDir)
 
 suite "fileHasStateModifyingOps":
   test "should detect state ops in fixture with mkDir":
@@ -646,3 +989,130 @@ version = "0.1.0"
 Requires "nim >= 1.6.0"
 """
     check contentHasStateModifyingOps(content) == false
+
+suite "Declarative parser full metadata (#1857)":
+  # `nimble dump` used to always go through the VM parser for full metadata,
+  # which forced it to bootstrap (and download) a Nim toolchain. These fields
+  # are plain literals in an ordinary .nimble file, so read them statically.
+  test "should extract every metadata field dump prints":
+    let content = """
+packageName    = "renamed"
+version        = "0.2.0"
+author         = "repro"
+description    = "dump must not need the VM"
+license        = "MIT"
+srcDir         = "src"
+binDir         = "build"
+backend        = "cpp"
+skipDirs       = @["tests"]
+skipFiles      = @["ignore.txt"]
+skipExt        = @["nim"]
+installDirs    = @["data"]
+installFiles   = @["readme.md"]
+installExt     = @["png"]
+entryPoints    = @["entry.nim"]
+testEntryPoint = "tests/tall.nim"
+
+requires "nim >= 2.0.8"
+"""
+    var options = initOptions()
+    let info = extractRequiresInfoFromContent(content, options)
+    check info.issues == {}
+    check info.packageName == "renamed"
+    check info.author == "repro"
+    check info.description == "dump must not need the VM"
+    check info.license == "MIT"
+    check info.backend == "cpp"
+    check info.skipDirs == @["tests"]
+    check info.skipFiles == @["ignore.txt"]
+    check info.skipExt == @["nim"]
+    check info.installDirs == @["data"]
+    check info.installFiles == @["readme.md"]
+    check info.installExt == @["png"]
+    check info.entryPoints == @["entry.nim"]
+    check info.testEntryPoint == "tests/tall.nim"
+
+  test "should parse metadata fields in snake_case":
+    let content = """
+package_name     = "renamed"
+skip_dirs        = @["tests"]
+install_ext      = @["png"]
+entry_points     = @["entry.nim"]
+test_entry_point = "tests/tall.nim"
+"""
+    var options = initOptions()
+    let info = extractRequiresInfoFromContent(content, options)
+    check info.packageName == "renamed"
+    check info.skipDirs == @["tests"]
+    check info.installExt == @["png"]
+    check info.entryPoints == @["entry.nim"]
+    check info.testEntryPoint == "tests/tall.nim"
+
+  test "should flag a non-literal metadata value for the VM parser":
+    let content = """
+version = "0.1.0"
+const who = "repro"
+author = who
+"""
+    var options = initOptions()
+    let info = extractRequiresInfoFromContent(content, options)
+    check nfiNonLiteralMetadata in info.issues
+
+  test "should flag old-style call metadata for the VM parser":
+    # `author "x"` (call form) carries a value the assignment walker never sees,
+    # so a static read would silently report an empty author.
+    let content = """
+version "0.1.0"
+author "repro"
+license "MIT"
+"""
+    var options = initOptions()
+    let info = extractRequiresInfoFromContent(content, options)
+    check nfiNonLiteralMetadata in info.issues
+
+  test "should flag namedBin for the VM parser":
+    let content = """
+version = "0.1.0"
+namedBin["src/app"] = "tool"
+"""
+    var options = initOptions()
+    let info = extractRequiresInfoFromContent(content, options)
+    check nfiNonLiteralMetadata in info.issues
+
+  test "should not flag an ordinary declarative nimble file":
+    let content = """
+version = "0.1.0"
+author = "repro"
+description = "ordinary"
+license = "MIT"
+srcDir = "src"
+
+requires "nim >= 2.0.8"
+"""
+    var options = initOptions()
+    let info = extractRequiresInfoFromContent(content, options)
+    check info.issues == {}
+
+  test "should stay parsable for minimal info when only metadata is unreadable":
+    # nfiNonLiteralMetadata must not knock a file off the fast discovery path:
+    # minimal info is name/version/requires, none of which it touches.
+    let content = """
+version = "0.1.0"
+author "old style"
+namedBin["src/app"] = "tool"
+
+requires "nim >= 1.6.0"
+"""
+    var options = initOptions()
+    check isParsableByDeclarative(content, options)
+
+  test "should extract foreignDep declarations":
+    let content = """
+version = "0.1.0"
+foreignDep "openssl"
+foreignDep "libcurl"
+"""
+    var options = initOptions()
+    let info = extractRequiresInfoFromContent(content, options)
+    check info.issues == {}
+    check info.foreignDeps == @["openssl", "libcurl"]

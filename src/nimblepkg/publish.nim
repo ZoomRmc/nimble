@@ -5,17 +5,18 @@
 ## nim-lang/packages automatically.
 
 import system except TResult
-import httpclient, strutils, json, os, browsers, times, uri
+import strutils, json, os, browsers, times, uri
 import common, tools, cli, config, options, packageinfotypes, sha1hashes, version, download
 import strformat, sequtils, sets
+import chronos/apps/http/httpclient
 {.warning[UnusedImport]: off.}
-from net import SslCVerifyMode, newContext
 
 type
   Auth = object
     user: string
     token: string  ## GitHub access token
-    http: HttpClient ## http client for doing API requests
+    session: HttpSessionRef ## http session for doing API requests
+    headers: seq[HttpHeaderTuple]
 
 const
   ApiKeyFile = "github_api_token"
@@ -26,12 +27,13 @@ const
 proc userAborted() =
   raise nimbleError("User aborted the process.")
 
-proc createHeaders(a: Auth) =
-  a.http.headers = newHttpHeaders({
+proc createHeaders(a: var Auth) =
+  a.headers = @{
+    UserAgentHeader: nimbleUserAgent,
     "Authorization": "token $1" % a.token,
     "Content-Type": "application/x-www-form-urlencoded",
     "Accept": "*/*"
-  })
+  }
 
 proc requestNewToken(cfg: Config): string =
   display("Info:", "Please create a new personal access token on GitHub in" &
@@ -54,10 +56,18 @@ proc requestNewToken(cfg: Config): string =
   return token
 
 proc getGithubAuth(o: Options): Auth =
-  let cfg = o.config
-  let ctx = newSSLContext(o.disableSslCertCheck)
-  result.http = newHttpClient(proxy = getProxy(o), sslContext = ctx,
-                              userAgent = nimbleUserAgent)
+  let
+    cfg = o.config
+    flags =
+      if o.disableSslCertCheck:
+        {HttpClientFlag.NoVerifyHost, HttpClientFlag.NoVerifyServerName}
+      else:
+        {}
+
+  result.session = HttpSessionRef.new(
+    flags = flags, provider = getProvider($o.config.httpProxy)
+  )
+
   # always prefer the environment variable to asking for a new one
   if existsEnv(ApiTokenEnvironmentVariable):
     result.token = getEnv(ApiTokenEnvironmentVariable)
@@ -74,10 +84,17 @@ proc getGithubAuth(o: Options): Auth =
     except IOError:
       result.token = requestNewToken(cfg)
   createHeaders(result)
-  let resp = result.http.getContent("https://api.github.com/user").parseJson()
+  let
+    req = HttpClientRequestRef.new(
+      result.session, "https://api.github.com/user",
+      maxResponseHeadersSize = nimbleMaxResponseHeadersSize, headers = result.headers
+    ).valueOr:
+      raise newException(HttpRequestError, error)
+    resp = waitFor req.send()
+    respData = parseJson(bytesToString(waitFor resp.getBodyBytes()))
 
-  result.user = resp["login"].str
-  display("Success:", "Verified as " & result.user, Success, HighPriority)
+  result.user = respData["login"].str
+  display("Success:", "Verified as " & result.user, DisplayType.Success, HighPriority)
 
 proc isCorrectFork(j: JsonNode): bool =
   # Check whether this is a fork of the nimble packages repo.
@@ -87,16 +104,33 @@ proc isCorrectFork(j: JsonNode): bool =
 
 proc forkExists(a: Auth): bool =
   try:
-    let x = a.http.getContent(ReposUrl & a.user & "/packages")
-    let j = parseJson(x)
+    let req = HttpClientRequestRef.new(
+      a.session, ReposUrl & a.user & "/packages",
+      maxResponseHeadersSize = nimbleMaxResponseHeadersSize, headers = a.headers
+    ).valueOr:
+        raise nimbleError("Unable to create fork request: " & $error)
+    let resp = waitFor req.send()
+    let data = bytesToString(waitFor resp.getBodyBytes())
+    let j = parseJson(data)
     result = isCorrectFork(j)
-  except JsonParsingError, IOError:
+    waitFor resp.closeWait()
+  except JsonParsingError, HttpError:
     result = false
 
 proc createFork(a: Auth) =
   try:
-    discard a.http.postContent(ReposUrl & "nim-lang/packages/forks")
-  except HttpRequestError:
+    let req = HttpClientRequestRef.new(
+      a.session, ReposUrl & "nim-lang/packages/forks", MethodPost,
+      maxResponseHeadersSize = nimbleMaxResponseHeadersSize, headers = a.headers
+    ).valueOr:
+        raise nimbleError("Unable to create fork request: " & $error)
+    let resp = waitFor req.send()
+    if resp.status >= 400:
+      waitFor resp.closeWait()
+      raise newException(HttpRequestError,
+                         "Server returned status: " & $resp.status)
+    waitFor resp.closeWait()
+  except HttpError:
     raise nimbleError("Unable to create fork. Access token" &
                        " might not have enough permissions.")
 
@@ -108,8 +142,19 @@ proc createPullRequest(a: Auth, pkg: PackageInfo, url, branch: string): string =
       "base": defaultBranch,
       "body": &"{pkg.description}\n\n{url}"
   }
-  var body = a.http.postContent(ReposUrl & "nim-lang/packages/pulls", $payload)
+  let req = HttpClientRequestRef.new(
+      a.session,
+      ReposUrl & "nim-lang/packages/pulls",
+      MethodPost,
+      maxResponseHeadersSize = nimbleMaxResponseHeadersSize,
+      headers = a.headers,
+      body = stringToBytes($payload)
+    ).valueOr:
+      raise nimbleError("Unable to create PR request: " & $error)
+  let resp = waitFor req.send()
+  let body = bytesToString(waitFor resp.getBodyBytes())
   var pr = parseJson(body)
+  waitFor resp.closeWait()
   return pr{"html_url"}.getStr()
 
 proc `%`(s: openArray[string]): JsonNode =
@@ -162,8 +207,59 @@ proc editJson(p: PackageInfo; url, tags, downloadMethod: string) =
   })
   writeFile("packages.json", contents.pretty.cleanupWhitespace)
 
+proc gatherPublishData*(p: PackageInfo, o: Options):
+    tuple[url, downloadMethod, tags: string] =
+  ## Collects everything the user must supply to publish `p`: the repository
+  ## URL and download method (derived from the *local* repository) plus the
+  ## list of tags (prompted). This performs no GitHub network I/O, so it must
+  ## run before the GitHub session is opened. Otherwise a slow answer to the
+  ## tags prompt lets the pooled connection go stale and the PR request fails
+  ## with "Connection was closed before full request has been made" (#1738).
+  var url = ""
+  var downloadMethod = ""
+  if dirExists(os.getCurrentDir() / ".git"):
+    let (output, exitCode) = doCmdEx("git ls-remote --get-url")
+    if exitCode == 0:
+      url = output.strip
+      if url.endsWith(".git"): url.setLen(url.len - 4)
+      downloadMethod = "git"
+    let parsed = parseUri(url)
+
+    if parsed.scheme == "":
+      # Assuming that we got an ssh write/read URL.
+      let sshUrl = parseUri("ssh://" & url)
+      url = "https://" & sshUrl.hostname & "/" & sshUrl.port & sshUrl.path
+    elif parsed.username != "" or parsed.password != "":
+      # check for any confidential information
+      # TODO: Use raiseNimbleError(msg, hintMsg) here
+      raise nimbleError(
+        "Cannot publish the repository URL because it contains username " &
+        "and/or password. Fix the remote URL. Hint: \"git remote -v\"")
+
+  elif dirExists(os.getCurrentDir() / ".hg"):
+    downloadMethod = "hg"
+    # TODO: Retrieve URL from hg.
+  else:
+    raise nimbleError(
+         "No .git nor .hg directory found. Stopping.")
+
+  if url.len == 0:
+    url = o.promptCustom("GitHub URL of " & p.basicInfo.name & "?", "")
+    if url.len == 0: userAborted()
+
+  let tags = o.promptCustom(
+    "Whitespace separated list of tags? (For example: web library wrapper)",
+    ""
+  )
+  result = (url, downloadMethod, tags)
+
 proc publish*(p: PackageInfo, o: Options) =
   ## Publishes the package p.
+  # Gather all user-provided data (repo URL, download method, tags) up front,
+  # before opening the GitHub session, so a slow answer to the tags prompt can
+  # never leave the pooled connection stale (#1738).
+  let (url, downloadMethod, tags) = gatherPublishData(p, o)
+
   let auth = getGithubAuth(o)
   var pkgsDir = getNimbleUserTempDir() / "nimble-packages-fork"
   if not forkExists(auth):
@@ -200,45 +296,6 @@ proc publish*(p: PackageInfo, o: Options) =
     raise nimbleError(
         "No packages file found in cloned fork.")
 
-  # We need to do this **before** the cd:
-  # Determine what type of repo this is.
-  var url = ""
-  var downloadMethod = ""
-  if dirExists(os.getCurrentDir() / ".git"):
-    let (output, exitCode) = doCmdEx("git ls-remote --get-url")
-    if exitCode == 0:
-      url = output.strip
-      if url.endsWith(".git"): url.setLen(url.len - 4)
-      downloadMethod = "git"
-    let parsed = parseUri(url)
-
-    if parsed.scheme == "":
-      # Assuming that we got an ssh write/read URL.
-      let sshUrl = parseUri("ssh://" & url)
-      url = "https://" & sshUrl.hostname & "/" & sshUrl.port & sshUrl.path
-    elif parsed.username != "" or parsed.password != "":
-      # check for any confidential information
-      # TODO: Use raiseNimbleError(msg, hintMsg) here
-      raise nimbleError(
-        "Cannot publish the repository URL because it contains username " &
-        "and/or password. Fix the remote URL. Hint: \"git remote -v\"")
-
-  elif dirExists(os.getCurrentDir() / ".hg"):
-    downloadMethod = "hg"
-    # TODO: Retrieve URL from hg.
-  else:
-    raise nimbleError(
-         "No .git nor .hg directory found. Stopping.")
-
-  if url.len == 0:
-    url = promptCustom("GitHub URL of " & p.basicInfo.name & "?", "")
-    if url.len == 0: userAborted()
-
-  let tags = promptCustom(
-    "Whitespace separated list of tags? (For example: web library wrapper)",
-    ""
-  )
-
   cd pkgsDir:
     editJson(p, url, tags, downloadMethod)
     let branchName = "add-" & p.basicInfo.name & getTime().utc.format("HHmm")
@@ -247,4 +304,5 @@ proc publish*(p: PackageInfo, o: Options) =
     display("Pushing", "to remote of fork.", priority = HighPriority)
     doCmd("git push https://" & auth.token & "@github.com/" & auth.user & "/packages " & branchName)
     let prUrl = createPullRequest(auth, p, url, branchName)
-    display("Success:", "Pull request successful, check at " & prUrl , Success, HighPriority)
+    display("Success:", "Pull request successful, check at " & prUrl , DisplayType.Success, HighPriority)
+  waitFor auth.session.closeWait()

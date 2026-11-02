@@ -3,7 +3,7 @@
 
 import std/[sequtils, sets, options, os, strutils, tables, strformat]
 import chronos
-import nimblesat, packageinfotypes, options, version, declarativeparser, packageinfo, common,
+import nimblesolver, packageinfotypes, options, version, declarativeparser, packageinfo, common,
   cli, tools, nimscriptexecutor, packagemetadatafile,
   displaymessages, reversedeps, developfile, urls, download, sha1hashes,
   versiondiscovery, nimresolution, build
@@ -13,6 +13,7 @@ type PkgDownloadEntry = object
   ver: Version 
   pv: PkgTuple 
   vcsRevision: Sha1Hash 
+  lockFileDep: Option[LockFileDep]
   isRoot: bool 
   dlInfo: Option[PackageDownloadInfo] # resolved after collectDownloadEntries, before download
   download: Future[void] # set during downloadPkgs; nil if cached or skipped
@@ -25,6 +26,11 @@ proc getPkgInfoFromSolved*(satResult: SATResult, solvedPkg: SolvedPackage, optio
     #For the pkg list we need to check the version as there may be multiple versions of the same package
     if nameMatches(pkg, solvedPkg.pkgName, options) and pkg.basicInfo.version == solvedPkg.version:
       return pkg
+  if solvedPkg.pkgName.isNim:
+    result = initPackageInfo()
+    result.basicInfo.name = solvedPkg.pkgName
+    result.basicInfo.version = solvedPkg.version
+    return
   writeStackTrace()
   raise newNimbleError[NimbleError]("Package not found in solution: " & $solvedPkg.pkgName & " " & $solvedPkg.version)
 
@@ -40,6 +46,15 @@ proc displaySatisfiedMsg*(solvedPkgs: seq[SolvedPackage], pkgToInstall: seq[(str
       if pkg.pkgName notin pkgToInstall.mapIt(it[0]):
         for req in pkg.requirements:
           displayInfo(pkgDepsAlreadySatisfiedMsg(req), MediumPriority)
+
+proc displayDevelopDepsMsg*(satResult: SATResult, options: Options) =
+  ## Surface develop-linked dependencies so users can confirm the link is active
+  for pkg in satResult.pkgs:
+    if pkg.basicInfo.name.isNim: continue
+    if pkg.basicInfo.name == satResult.rootPackage.basicInfo.name: continue
+    if pkg.isInDevelopMode(options):
+      let srcDir = pkg.myPath.parentDir
+      displayInfo(&"{pkg.basicInfo.name} [develop: {srcDir}]", HighPriority)
 
 proc activateSolvedPkgFeatures*(satResult: SATResult, options: Options) =
   for pkg in satResult.pkgs:
@@ -227,7 +242,11 @@ proc installFromDirDownloadInfo(nimBin: Option[string], downloadDir: string, url
                                        nimbleDirBase.startsWith(downloadDir & "/")
 
       # Use yieldFilter to also yield directories (important for empty dirs like .git/refs/)
-      for path in walkDirRec(downloadDir, yieldFilter = {pcFile, pcDir}):
+      # and symlinks. Issue #1730: symlinked files (a shared source module a binary
+      # imports, a shared binary.nim.cfg, ...) were skipped here, so the build in
+      # buildtemp failed even though `nimble build` (which builds in place) worked.
+      for path in walkDirRec(downloadDir,
+                             yieldFilter = {pcFile, pcDir, pcLinkToFile, pcLinkToDir}):
         if buildTempIsInsideDownload and path.startsWith(buildTempBase):
           continue
         if nimbleDirIsInsideDownload and path.startsWith(nimbleDirBase):
@@ -242,7 +261,18 @@ proc installFromDirDownloadInfo(nimBin: Option[string], downloadDir: string, url
           continue
 
         let destPath = changeRoot(downloadDir, buildTempDir, path)
-        if path.dirExists:
+        if path.symlinkExists:
+          # Recreate the symlink so the build can resolve it (e.g. a shared
+          # source module or binary.nim.cfg). Fall back to copying the
+          # dereferenced content when the symlink can't be recreated (e.g.
+          # unprivileged Windows).
+          createDir(destPath.splitFile.dir)
+          try:
+            createSymlink(expandSymlink(path), destPath)
+          except OSError:
+            if path.fileExists:
+              discard copyFileD(path, destPath)
+        elif path.dirExists:
           createDir(destPath)
         else:
           createDir(destPath.splitFile.dir)
@@ -352,16 +382,19 @@ proc collectDownloadEntries(satResult: SATResult, pkgsToInstall: seq[(string, Ve
                             options: Options): seq[PkgDownloadEntry] =
   for (name, ver) in pkgsToInstall:
     let verRange = satResult.getVersionRangeFoPkgToInstall(name, ver)
-    let vcsRevision = if name in options.satResult.lockFileVcsRevisions:
-      options.satResult.lockFileVcsRevisions[name]
-    else:
-      notSetSha1Hash
+    let lockFileDep =
+      if name in satResult.lockFileDeps: some(satResult.lockFileDeps[name])
+      else: none(LockFileDep)
+    let vcsRevision =
+      if lockFileDep.isSome: lockFileDep.get.vcsRevision
+      else: notSetSha1Hash
     var pv = (name: name, ver: verRange)
     let isRootPkg = pv.name == rootName and
       (rootName notin installedPkgs.mapIt(it.basicInfo.name) or satResult.rootPackage.hasLockFile(options))
     if not isRootPkg and pv.name in options.satResult.normalizedRequirements:
       pv.name = options.satResult.normalizedRequirements[pv.name]
-    result.add(PkgDownloadEntry(name: name, ver: ver, pv: pv, vcsRevision: vcsRevision,
+    result.add(PkgDownloadEntry(name: name, ver: ver, pv: pv,
+                vcsRevision: vcsRevision, lockFileDep: lockFileDep,
                 isRoot: isRootPkg))
 
 proc resolveDownloadInfo(entries: var seq[PkgDownloadEntry], options: Options) =
@@ -370,6 +403,13 @@ proc resolveDownloadInfo(entries: var seq[PkgDownloadEntry], options: Options) =
       continue
     var pv = entries[i].pv
     var dlInfo: PackageDownloadInfo
+    if entries[i].lockFileDep.isSome and
+       entries[i].lockFileDep.get.url.len > 0:
+      dlInfo = getLockFileDownloadInfo(
+        pv, entries[i].lockFileDep.get, options)
+      entries[i].pv = dlInfo.pv
+      entries[i].dlInfo = some(dlInfo)
+      continue
     try:
       dlInfo = getPackageDownloadInfo(pv, options, doPrompt = true, vcsRevision = entries[i].vcsRevision)
     except CatchableError as e:
@@ -482,13 +522,15 @@ proc installPkgs*(satResult: var SATResult, options: var Options, nimBin: Option
    #If we are not in the root folder, means user is installing a package globally so we need to install root
   var installedPkgs = initHashSet[PackageInfo]()
   # echo "isInRootDir ", isInRootDir, " startDir ", options.startDir, " rootDir ", satResult.rootPackage.myPath.parentDir
-  if options.action.typ == actionInstall and not options.depsOnly: #only install action install the root package: #skip root when in localdeps mode and in rootdir
+  if options.action.typ == actionInstall and not options.depsOnly and
+     not (isInRootDir and options.action.packages.len > 0): #only install action install the root package: #skip root when in localdeps mode and in rootdir or when installing specific packages from root
     pkgsToInstall.add((name: satResult.rootPackage.basicInfo.name, ver: satResult.rootPackage.basicInfo.version))
   else:
     #Root can be assumed as installed as the only global action one can do is install
     installedPkgs.incl(satResult.rootPackage)
 
   displaySatisfiedMsg(satResult.solvedPkgs, pkgsToInstall, options)
+  displayDevelopDepsMsg(satResult, options)
   #If package is in develop mode, we dont need to install it.
   var newlyInstalledPkgs = initHashSet[PackageInfo]()
   let rootName = satResult.rootPackage.basicInfo.name

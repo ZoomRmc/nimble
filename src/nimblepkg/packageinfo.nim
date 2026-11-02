@@ -3,9 +3,9 @@
 
 # Stdlib imports
 import system except TResult
-import hashes, strutils, os, sets, tables, times, httpclient, strformat
-from net import SslError
+import hashes, strutils, os, sets, tables, times, strformat
 
+import chronos/apps/http/httpclient
 import zippy
 
 import compat/json
@@ -131,13 +131,27 @@ proc validatePackagesList(path: string): bool =
   except ValueError, JsonParsingError:
     return false
 
-proc fetchList*(list: PackageList, options: Options) =
+# Cache after first call. Keyed by the list's file rather than its name: one
+# process can read the same list from more than one nimble dir.
+var
+  gPackageJson {.threadvar.}: TableRef[string, JsonNode]
+
+proc getGPackageJson(): TableRef[string, JsonNode] =
+  if gPackageJson.isNil:
+    gPackageJson = newTable[string, JsonNode]()
+  return gPackageJson
+
+proc packageListFile(name: string, options: Options): string =
+  options.getNimbleDir() / "packages_" & name.toLowerAscii() & ".json"
+
+proc fetchList*(list: PackageList, options: Options) {.async.} =
   ## Downloads or copies the specified package list and saves it in $nimbleDir.
   let verb = if list.urls.len > 0: "Downloading" else: "Copying"
   display(verb, list.name & " package list", priority = HighPriority)
 
   var
     lastError = ""
+    lastErrorHint = ""
     copyFromPath = ""
   if list.urls.len > 0:
     for i in 0 ..< list.urls.len:
@@ -146,35 +160,58 @@ proc fetchList*(list: PackageList, options: Options) =
       let tempPath = options.getNimbleDir() / "packages_temp.json"
 
       # Grab the proxy
-      let proxy = getProxy(options)
-      if not proxy.isNil:
-        var maskedUrl = proxy.url
+      let proxyUrl = getProxyUrl($options.config.httpProxy)
+      if proxyUrl.isSome:
+        var maskedUrl = parseUri(proxyUrl.get())
         if maskedUrl.password.len > 0: maskedUrl.password = "***"
         display("Connecting", "to proxy at " & $maskedUrl,
                 priority = LowPriority)
 
+      let
+        flags = if options.disableSslCertCheck:
+          {HttpClientFlag.NoVerifyHost, HttpClientFlag.NoVerifyServerName}
+        else:
+          {}
+
       try:
-        let ctx = newSSLContext(options.disableSslCertCheck)
-        let client = newHttpClient(proxy = proxy, sslContext = ctx,
-                                   userAgent = nimbleUserAgent)
-        client.headers = newHttpHeaders({"Accept-Encoding": "gzip"})
-        let resp = client.get(url)
-        if resp.code.is4xx or resp.code.is5xx:
-          raise newException(HttpRequestError,
-            "Server returned status: " & $resp.code & " " & resp.status)
-        var body = resp.body
-        let encoding = ($resp.headers.getOrDefault("content-encoding")).strip.toLowerAscii
-        if encoding == "gzip":
-          body = uncompress(body, dfGzip)
-        writeFile(tempPath, body)
-      except SslError:
-        let message = "Failed to verify the SSL certificate for " & url
-        raise nimbleError(message, "Use --noSSLCheck to ignore this error.")
+        let session = HttpSessionRef.new(flags = flags, provider = getProvider($options.config.httpProxy))
+        try:
+          let
+            request = HttpClientRequestRef.new(
+              session, url, maxResponseHeadersSize = nimbleMaxResponseHeadersSize,
+              headers = {UserAgentHeader: nimbleUserAgent, "Accept-Encoding": "gzip"}
+            ).valueOr:
+              raise newException(HttpRequestError, error)
+            response = await request.send()
+          if response.status >= 400:
+            raise newException(HttpRequestError,
+              "Server returned status: " & $response.status)
+          var body = bytesToString(await response.getBodyBytes())
+          let encoding = response.headers.getLastString("content-encoding").strip.toLowerAscii
+          if encoding == "gzip":
+            body = uncompress(body, dfGzip)
+          writeFile(tempPath, body)
+        finally:
+          await session.closeWait()
+      except HttpConnectionError:
+        # chronos raises HttpConnectionError for every connection-level failure:
+        # DNS resolution, TCP connect, a connect timeout, a proxy failure and a
+        # TLS handshake error all land here. Only some of those are certificate
+        # problems, so report the reason chronos gives rather than asserting
+        # one, and carry on to the remaining mirrors like any other failure -
+        # aborting here left the other mirrors untried. See issue #1845.
+        let message = "Could not download: " & getCurrentExceptionMsg()
+        display("Warning:", message, Warning)
+        lastError = message
+        lastErrorHint = "If this is a certificate problem, " &
+                        "use --noSSLCheck to ignore it."
+        continue
 
       except:
         let message = "Could not download: " & getCurrentExceptionMsg()
         display("Warning:", message, Warning)
         lastError = message
+        lastErrorHint = ""
         continue
 
       if not validatePackagesList(tempPath):
@@ -183,7 +220,7 @@ proc fetchList*(list: PackageList, options: Options) =
         continue
 
       copyFromPath = tempPath
-      display("Success", "Package list downloaded.", Success, HighPriority)
+      display("Success", "Package list downloaded.", DisplayType.Success, HighPriority)
       lastError = ""
       break
 
@@ -193,31 +230,25 @@ proc fetchList*(list: PackageList, options: Options) =
       display("Warning:", lastError & ", discarding.", Warning)
     else:
       copyFromPath = list.path
-      display("Success", "Package list copied.", Success, HighPriority)
+      display("Success", "Package list copied.", DisplayType.Success, HighPriority)
 
   if lastError.len != 0:
     if list.name == "local":
       display("Warning:", lastError & ", discarding.", Warning)
     else:
-      raise nimbleError("Refresh failed\n" & lastError)
+      raise nimbleError("Refresh failed\n" & lastError, lastErrorHint)
 
   if copyFromPath.len > 0:
-    copyFile(copyFromPath,
-        options.getNimbleDir() / "packages_$1.json" % list.name.toLowerAscii())
+    let listFile = packageListFile(list.name, options)
+    copyFile(copyFromPath, listFile)
+    # Whatever was read from the old file is out of date now.
+    getGPackageJson().del(listFile)
 
-# Cache after first call
-var
-  gPackageJson {.threadvar.}: TableRef[string, JsonNode]
-
-proc getGPackageJson(): TableRef[string, JsonNode] =
-  if gPackageJson.isNil:
-    gPackageJson = newTable[string, JsonNode]()
-  return gPackageJson
-
-proc readPackageList(name: string, options: Options, ignorePackageCache = false): JsonNode =
+proc readPackageList(name: string, options: Options, ignorePackageCache = false): Future[JsonNode] {.async.} =
   # If packages.json is not present ask the user if they want to download it.
-  if (not ignorePackageCache) and getGPackageJson().hasKey(name):
-    return getGPackageJson()[name]
+  let file = packageListFile(name, options)
+  if (not ignorePackageCache) and getGPackageJson().hasKey(file):
+    return getGPackageJson()[file]
 
   display("Reading", "$1 package list" % name, priority = LowPriority)
 
@@ -225,18 +256,17 @@ proc readPackageList(name: string, options: Options, ignorePackageCache = false)
     if options.prompt("No local packages.json found, download it from " &
             "internet?"):
       for name, list in options.config.packageLists:
-        fetchList(list, options)
+          await fetchList(list, options)
     else:
       # The user might not need a package list for now. So let's try
       # going further.
-      getGPackageJson()[name] = newJArray()
-      return getGPackageJson()[name]
-  let file = options.getNimbleDir() / "packages_" & name.toLowerAscii() & ".json"
+      getGPackageJson()[file] = newJArray()
+      return getGPackageJson()[file]
   if file.fileExists:
-    getGPackageJson()[name] = parseFile(file)
+    getGPackageJson()[file] = parseFile(file)
   else:
-    getGPackageJson()[name] = newJArray()
-  return getGPackageJson()[name]
+    getGPackageJson()[file] = newJArray()
+  return getGPackageJson()[file]
 
 proc getPackage*(pkg: string, options: Options, resPkg: var Package, ignorePackageCache = false): bool {.gcsafe, raises: [CatchableError].}
 proc resolveAlias(pkg: Package, options: Options): Package =
@@ -259,7 +289,7 @@ proc getPackage*(pkg: string, options: Options, resPkg: var Package, ignorePacka
   ##
   ## Aliases are handled and resolved.
   for name, list in options.config.packageLists:
-    let packages = readPackageList(name, options, ignorePackageCache)
+    let packages = waitFor readPackageList(name, options, ignorePackageCache)
     for p in packages:
       if normalize(p["name"].str) == normalize(pkg):
         resPkg = p.fromJson()
@@ -274,11 +304,11 @@ proc getPackage*(name: string, options: Options): Package =
       "Cannot find package with name '" & name & "'.")
 {.warning[ProveInit]: on.}
 
-proc getPackageList*(options: Options): seq[Package] =
+proc getPackageList*(options: Options): Future[seq[Package]] {.async.} =
   ## Returns the list of packages found in the downloaded packages.json files.
   var namesAdded: HashSet[string]
   for name, list in options.config.packageLists:
-    let packages = readPackageList(name, options)
+    let packages = await readPackageList(name, options)
     for p in packages:
       let pkg: Package = p.fromJson()
       if pkg.name notin namesAdded:
@@ -297,13 +327,17 @@ proc setNameVersionChecksum*(pkgInfo: var PackageInfo, pkgDir: string) =
 
 proc getInstalledPackageMin*(options: Options, pkgDir, nimbleFilePath: string): PackageInfo =
   result = initPackageInfo(options, nimbleFilePath)
-  setNameVersionChecksum(result, pkgDir)
   result.infoKind = pikMinimal
   result.source = psInstalled
   try:
     fillMetaData(result, pkgDir, true, options)
   except MetaDataError:
     discard
+  # After `fillMetaData`, which replaces the whole `metaData`: this is what
+  # keeps the directory's version in `specialVersions`, the set `withinRange`
+  # and `findPkg` match on. Metadata files without it (Nim in the binaries
+  # dir) otherwise hide the package - see #1855.
+  setNameVersionChecksum(result, pkgDir)
 
 proc getInstalledPkgsMin*(libsDir: string, options: Options): seq[PackageInfo] =
   ## Gets a list of installed packages. The resulting package info is
@@ -690,6 +724,23 @@ proc isNim*(name: string): bool =
 
 proc isNim*(pv: PkgTuple): bool = pv.name.isNim
 
+proc lockFileHasNim*(lockFilePath: string, options: Options): bool =
+  ## Returns true when the lock file at `lockFilePath` exists and pins a nim
+  ## entry. `getLockedDependencies` yields nothing for a missing file, so this
+  ## is false when there is no lock file.
+  for name, _ in lockFilePath.getLockedDependencies.lockedDepsFor(options):
+    if name.isNim:
+      return true
+  false
+
+proc isSynthetic*(pkgInfo: PackageInfo): bool =
+  ## A synthetic package has no `.nimble` file on disk. This is only produced for
+  ## a system Nim discovered by its binary alone (e.g. Debian's apt layout: nim
+  ## in /usr/bin, stdlib in /usr/lib/nim, no nim.nimble — see #1757). The `isNim`
+  ## guard keeps ordinary packages — whose `.nimble` file must exist — from ever
+  ## being classified as synthetic.
+  pkgInfo.basicInfo.name.isNim and not pkgInfo.myPath.fileExists
+
 proc hasLockFile*(pkgInfo: PackageInfo, options: Options): bool =
   return options.lockFile(pkgInfo.myPath.parentDir()).fileExists
 
@@ -707,3 +758,41 @@ when isMainModule:
   test "toValidPackageName":
     check toValidPackageName("foo__bar") == "foo_bar"
     check toValidPackageName("jhbasdh!£$@%#^_&*_()qwe") == "jhbasdh_qwe"
+
+  test "a package list is read from its own nimble dir, and again once refreshed":
+    # Lists stay cached for the whole process, and the test runner shares one
+    # process between every suite. A cached list must stand in neither for
+    # another nimble dir's list nor for the one a refresh just replaced.
+    let dir = getTempDir() / "tpackagelistcache"
+    let source = dir / "packages.json"
+    removeDir(dir)
+    createDir(dir)
+    defer: removeDir(dir)
+    proc writeList(names: varargs[string]) =
+      var list = newJArray()
+      for name in names:
+        list.add %*{"name": name, "url": "https://example.com/" & name,
+                    "method": "git", "tags": [], "description": "",
+                    "license": "MIT"}
+      writeFile(source, $list)
+
+    var options = initOptions()
+    let list = PackageList(name: "test", path: source)
+    options.config.packageLists = {"test": list}.toTable
+    var pkg: Package
+
+    options.nimbleDir = dir / "a"
+    createDir(options.nimbleDir)
+    writeList("first")
+    waitFor fetchList(list, options)
+    check getPackage("first", options, pkg)
+
+    options.nimbleDir = dir / "b"
+    createDir(options.nimbleDir)
+    writeList("second")
+    waitFor fetchList(list, options)
+    check getPackage("second", options, pkg)
+
+    writeList("second", "third")
+    waitFor fetchList(list, options)
+    check getPackage("third", options, pkg)

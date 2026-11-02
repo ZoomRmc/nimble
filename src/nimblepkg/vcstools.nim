@@ -1,4 +1,4 @@
-# Copyright (C) Dominik Picheta. All rights reserved.
+# Copyright (C) the Nimble contributors. All rights reserved.
 # BSD License. Look at license.txt for more info.
 
 ## This module implements some operations which use version control system
@@ -66,12 +66,35 @@ proc getVcsDefaultRemoteName*(vcsType: VcsType): string =
 proc dirDoesNotExistErrorMsg(dir: Path): string  =
   &"The directory \"{dir}\" does not exist."
 
+proc isGitRepoDir(dir: Path): bool =
+  ## Checks whether `dir` is a directory Git itself would accept as a
+  ## repository. Mirrors the signatures Git looks for in its own
+  ## `is_git_directory()`: a `HEAD` reference plus the `objects` and `refs`
+  ## directories.
+  (dir / "HEAD".Path).fileExists and
+  (dir / "objects".Path).dirExists and
+  (dir / "refs".Path).dirExists
+
+proc isHgRepoDir(dir: Path): bool =
+  ## Checks whether `dir` is a directory Mercurial itself would accept as a
+  ## repository. `requires` is written by every Mercurial since 0.9.2; the other
+  ## two markers cover repositories created by older versions.
+  (dir / "requires".Path).fileExists or
+  (dir / "store".Path).dirExists or
+  (dir / "00changelog.i".Path).fileExists
+
 proc hasVcsSubDir*(dir: Path): VcsType =
   ## Checks whether a directory has a special subdirectory for some supported
   ## kind of VCS.
-  if (dir / gitSpecialDir.Path).dirExists:
+  ##
+  ## The special directory must also look like a repository the corresponding
+  ## tool would accept. The mere presence of a `.git` or `.hg` directory is not
+  ## enough: unrelated programs keep their own state in a directory of that
+  ## name, and accepting one makes every later VCS command fail with "not a git
+  ## repository" instead of Nimble treating the directory as `vcsTypeNone`.
+  if (dir / gitSpecialDir.Path).isGitRepoDir:
     result = vcsTypeGit
-  elif (dir / hgSpecialDir.Path).dirExists:
+  elif (dir / hgSpecialDir.Path).isHgRepoDir:
     result = vcsTypeHg
   else:
     result = vcsTypeNone
@@ -254,9 +277,19 @@ proc getPackageFileList*(dir: Path): seq[string] =
     # Fall back to filesystem listing
     return dir.getPackageFileListWithoutVcs
 
+  # An empty listing means the VCS knows about `dir` but tracks no file in it.
+  # That happens whenever `dir` sits inside an unrelated repository - a package
+  # cache under a `$HOME` that is itself a git repo (dotfiles), a vendored copy
+  # dropped into a checkout - where `git ls-files` succeeds and prints nothing
+  # instead of failing, so the `except` above never fires. Splitting "" yields
+  # @[""], which hashes the empty string and gives every such package the same
+  # bogus checksum (da39a3ee...), making lock files non-reproducible across
+  # machines. A package directory always has files, so fall back to the file
+  # system instead. Found while investigating #1840.
+  let strippedOutput = output.strip
   return
-    if output != noVcsOutput:
-      output.strip.splitLines
+    if output != noVcsOutput and strippedOutput.len > 0:
+      strippedOutput.splitLines
     else:
       dir.getPackageFileListWithoutVcs
 
@@ -381,7 +414,7 @@ proc isVcsRevisionPresentOnSomeRemote*(
       for remotePushUrl in path.getRemotesPushUrls:
         let
           remotePushUrl = remotePushUrl.quoteShell
-          (_, fetchCmdExitCode) = doCmdEx(&"{git(path)} fetch {remotePushUrl}")
+          (_, fetchCmdExitCode) = doCmdEx(&"{git(path)} fetch -- {remotePushUrl}")
         if fetchCmdExitCode == QuitFailure:
           continue
         if checkContains(): return true
@@ -394,7 +427,7 @@ proc isVcsRevisionPresentOnSomeRemote*(
       let
         remotePushUrl = remotePushUrl.quoteShell
         (_, exitCode) = doCmdEx(
-          &"{hg(path)} pull {remotePushUrl} -r {vcsRevision} -q")
+          &"{hg(path)} pull -r {vcsRevision} -q -- {remotePushUrl}")
       if exitCode == QuitSuccess:
         return true
   else:
@@ -1102,5 +1135,24 @@ username = John Doe <john.doe@example.com>
 
     test "getPackageFileList":
       check getPackageFileList(testNoVcsDir) == @[testFile, testSubDirFile]
+
+    test "a stray .git directory is not a repository":
+      # Programs unrelated to Git keep state in a directory called `.git`. Such
+      # a directory used to stop the parent walk and make Nimble run Git
+      # commands that can only fail with "not a git repository".
+      # Kept outside `testNoVcsDir` so the suite stays independent of test order.
+      let strayDir = tempDir / "testStrayGitDir"
+      createDir(strayDir / ".git" / "info")
+      writeFile(strayDir / ".git" / "project-id", "")
+      defer: removeDir(strayDir)
+
+      let packageDir = (strayDir / "package").Path
+      createDir($packageDir)
+      writeFile($packageDir / testFile, testFileContent)
+
+      check hasVcsSubDir(strayDir.Path) == vcsTypeNone
+      check getVcsType(packageDir) == vcsTypeNone
+      check getPackageFileList(packageDir) == @[testFile]
+      check not isValidSha1Hash($getVcsRevision(packageDir))
 
     tearDownSuite(testNoVcsDir)

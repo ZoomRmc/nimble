@@ -1,4 +1,4 @@
-# Copyright (C) Dominik Picheta. All rights reserved.
+# Copyright (C) the Nimble contributors. All rights reserved.
 # BSD License. Look at license.txt for more info.
 
 {.used.}
@@ -15,12 +15,13 @@ import nimblepkg/vcstools
 from nimblepkg/common import cd, dump, cdNewDir
 from nimblepkg/tools import tryDoCmdEx, doCmdEx
 from nimblepkg/packageinfotypes import DownloadMethod
-from nimblepkg/version import PkgTuple, `$`
+from nimblepkg/version import PkgTuple, `$`, newVersion, withinRange
 from nimblepkg/lockfile import LockFileJsonKeys
 from nimblepkg/options import defaultLockFileName, defaultDevelopPath, initOptions
 from nimblepkg/developfile import ValidationError, ValidationErrorKind,
   developFileName, getValidationErrorMessage
 from nimblepkg/declarativeparser import extractRequiresInfo, getRequires
+from nimblepkg/checksums import calculateDirSha1Checksum
 
 suite "lock file":
   type
@@ -299,6 +300,32 @@ requires "nim >= 1.5.1"
       cd mainPkgRepoPath:
         testLockFile(@[(dep1PkgName, dep1PkgRepoPath)], isNew = true)
 
+  test "develop dependencies are locked with url and checksum":
+    # After `nimble develop -a:<dep>` + `nimble lock` each develop dependency
+    # must land in the lock file with a non-empty url and checksum. Regression
+    # for `develop --with-dependencies` producing an unusable lock file whose
+    # develop/vendor deps had empty `url` and `checksums.sha1`.
+    cleanUp()
+    withPkgListFile:
+      initNewNimblePackage(mainPkgOriginRepoPath, mainPkgRepoPath,
+                           @[dep1PkgName, dep2PkgName])
+      initNewNimblePackage(dep1PkgOriginRepoPath, dep1PkgRepoPath)
+      initNewNimblePackage(dep2PkgOriginRepoPath, dep2PkgRepoPath)
+      cd mainPkgRepoPath:
+        let (_, devExitCode) = execNimble("develop",
+          &"-a:{dep1PkgRepoPath}", &"-a:{dep2PkgRepoPath}")
+        check devExitCode == QuitSuccess
+
+        let (_, exitCode) = execNimbleYes("lock")
+        check exitCode == QuitSuccess
+
+        let json = defaultLockFileName.readFile.parseJson
+        for depName in @[dep1PkgName, dep2PkgName]:
+          check depName in json{$lfjkPackages}
+          let entry = json{$lfjkPackages}{depName}
+          check entry{"url"}.getStr.len > 0
+          check entry{"checksums"}{"sha1"}.getStr.len > 0
+
   test "can generate overridden lock file":
     cleanUp()
     withPkgListFile:
@@ -359,6 +386,104 @@ requires "nim >= 1.5.1"
           output.processOutput.inLines(
           "Downloaded package's version does not satisfy requested version range: wanted > 0.1.0 got 0.1.0.")
 
+  test "lock aligns an out-of-range develop dependency to the resolved version":
+    cleanUp()
+    withPkgListFile:
+      initNewNimblePackage(mainPkgOriginRepoPath, mainPkgRepoPath, @[dep1PkgName])
+
+      # dep1 origin with TWO tagged versions: 0.1.0 then 0.2.0.
+      cdNewDir dep1PkgOriginRepoPath:
+        initRepo()
+        discard dep1PkgOriginRepoPath.initNewNimbleFile()   # version 0.1.0
+        addFiles(dep1PkgNimbleFileName)
+        commit("v0.1.0")
+        tryDoCmdEx("git tag v0.1.0")
+        # bump to 0.2.0
+        writeFile(dep1PkgNimbleFileName,
+          readFile(dep1PkgNimbleFileName).replace("0.1.0", "0.2.0"))
+        commit("v0.2.0")
+        tryDoCmdEx("git tag v0.2.0")
+
+      # develop clone has BOTH tags; park it on the OLD version 0.1.0.
+      clone(dep1PkgOriginRepoPath, dep1PkgRepoPath)
+      var oldRev, newRev: string
+      cd dep1PkgRepoPath:
+        checkout("v0.1.0")
+        oldRev = getRepoRevision()
+        newRev = tryDoCmdEx("git rev-parse v0.2.0").replace("\n", "")
+      check oldRev != newRev
+
+      cd mainPkgRepoPath:
+        # require the NEW version; develop checkout (0.1.0) is out of range.
+        let nimbleFileContent = mainPkgNimbleFileName.readFile
+        mainPkgNimbleFileName.writeFile(
+          nimbleFileContent.replace(&"\"{dep1PkgName}\"", &"\"{dep1PkgName} >= 0.2.0\""))
+        writeDevelopFile(developFileName, @[], @[dep1PkgRepoPath])
+
+        let (output {.used.}, exitCode) = execNimbleYes("lock")
+        check exitCode == QuitSuccess
+        # the develop checkout was moved from v0.1.0 to the v0.2.0 commit
+        cd dep1PkgRepoPath: check getRepoRevision() == newRev
+        # and the lock records dep1 at the aligned (v0.2.0) revision
+        check getRevision(dep1PkgName) == newRev
+
+  test "lock refuses to align a develop dependency with a dirty working copy":
+    cleanUp()
+    withPkgListFile:
+      initNewNimblePackage(mainPkgOriginRepoPath, mainPkgRepoPath, @[dep1PkgName])
+
+      cdNewDir dep1PkgOriginRepoPath:
+        initRepo()
+        discard dep1PkgOriginRepoPath.initNewNimbleFile()
+        addFiles(dep1PkgNimbleFileName)
+        commit("v0.1.0")
+        tryDoCmdEx("git tag v0.1.0")
+        writeFile(dep1PkgNimbleFileName,
+          readFile(dep1PkgNimbleFileName).replace("0.1.0", "0.2.0"))
+        commit("v0.2.0")
+        tryDoCmdEx("git tag v0.2.0")
+
+      clone(dep1PkgOriginRepoPath, dep1PkgRepoPath)
+      cd dep1PkgRepoPath:
+        checkout("v0.1.0")
+        # Dirty a TRACKED file. `isWorkingCopyClean` runs `git status
+        # --untracked-files=no`, so an untracked file would NOT count as dirty.
+        writeFile(dep1PkgNimbleFileName,
+          readFile(dep1PkgNimbleFileName) & "\n# dirty\n")
+
+      cd mainPkgRepoPath:
+        let nimbleFileContent = mainPkgNimbleFileName.readFile
+        mainPkgNimbleFileName.writeFile(
+          nimbleFileContent.replace(&"\"{dep1PkgName}\"", &"\"{dep1PkgName} >= 0.2.0\""))
+        writeDevelopFile(developFileName, @[], @[dep1PkgRepoPath])
+
+        var revBefore: string
+        cd dep1PkgRepoPath: revBefore = getRepoRevision()
+        let (output, exitCode) = execNimbleYes("lock")
+        check exitCode == QuitFailure
+        check output.contains("uncommitted changes")
+        check output.contains(dep1PkgName)
+        # checkout did NOT move (we raise before doCheckout on a dirty repo)
+        var revAfter: string
+        cd dep1PkgRepoPath: revAfter = getRepoRevision()
+        check revAfter == revBefore
+
+  test "lock leaves an in-range develop dependency untouched":
+    cleanUp()
+    withPkgListFile:
+      initNewNimblePackage(mainPkgOriginRepoPath, mainPkgRepoPath, @[dep1PkgName])
+      initNewNimblePackage(dep1PkgOriginRepoPath, dep1PkgRepoPath)   # single version 0.1.0
+      cd mainPkgRepoPath:
+        writeDevelopFile(developFileName, @[], @[dep1PkgRepoPath])
+        var revBefore: string
+        cd dep1PkgRepoPath: revBefore = getRepoRevision()
+        let (_, exitCode) = execNimbleYes("lock")
+        check exitCode == QuitSuccess
+        var revAfter: string
+        cd dep1PkgRepoPath: revAfter = getRepoRevision()
+        check revAfter == revBefore                  # no move
+        check getRevision(dep1PkgName) == revBefore
+
   test "can download locked dependencies":
     cleanUp()
     withPkgListFile:
@@ -378,6 +503,65 @@ requires "nim >= 1.5.1"
               lines.inLines(&"Fetching {dep1PkgOriginRepoPath}")
         check lines.inLines(&"Downloading {dep2PkgOriginRepoPath}") or
               lines.inLines(&"Fetching {dep2PkgOriginRepoPath}")
+
+  test "uses the repository URL from the lock file (#1837)":
+    cleanUp()
+    withPkgListFile:
+      initNewNimblePackage(mainPkgOriginRepoPath, mainPkgRepoPath,
+                           @[dep1PkgName])
+
+      # packages.json points dep1 at this repository. Its revision is
+      # deliberately unrelated to the one in the lock file.
+      initNewNimblePackage(dep1PkgOriginRepoPath, dep1PkgRepoPath)
+
+      # The lock file points the same package name at a different repository.
+      # A marker module makes it possible to verify which source was installed.
+      let lockedOrigin = originsDirPath / "locked-dep1"
+      cdNewDir lockedOrigin:
+        initRepo()
+        writeFile(dep1PkgNimbleFileName,
+                  newNimbleFileContent(dep1PkgName, nimbleFileTemplate, @[]))
+        writeFile(dep1PkgName & ".nim", "const fromLockedRepository* = true\n")
+        addFiles(dep1PkgNimbleFileName, dep1PkgName & ".nim")
+        commit("Create locked dep1 fork")
+
+      var lockedRevision: string
+      cd lockedOrigin:
+        lockedRevision = getRepoRevision()
+      let lockedChecksum = calculateDirSha1Checksum(lockedOrigin)
+
+      cd mainPkgRepoPath:
+        writeFile(defaultLockFileName, (%*{
+          "version": 2,
+          "packages": {
+            dep1PkgName: {
+              "version": "0.1.0",
+              "vcsRevision": lockedRevision,
+              "url": lockedOrigin,
+              "downloadMethod": "git",
+              "dependencies": [],
+              "checksums": {"sha1": $lockedChecksum}
+            }
+          },
+          "tasks": {}
+        }).pretty)
+
+        let (output, exitCode) = execNimbleYes("setup", "--debug")
+        checkpoint output
+        check exitCode == QuitSuccess
+        check output.contains(lockedOrigin)
+        check not output.contains(
+          &"Downloading {dep1PkgOriginRepoPath} (")
+        check not output.contains(
+          &"Fetching {dep1PkgOriginRepoPath} (")
+
+        var installedLockedSource = false
+        for kind, path in walkDir(pkgsDir):
+          if kind == pcDir and
+             path.extractFilename.startsWith(dep1PkgName & "-"):
+            installedLockedSource = fileExists(path / (dep1PkgName & ".nim"))
+            break
+        check installedLockedSource
 
   # test "can update already existing lock file":
   #   cleanUp()
@@ -609,6 +793,125 @@ requires "nim >= 1.5.1"
           check newRevision == getRevision(dep1PkgName)
           check res.exitCode == QuitSuccess
 
+  test "upgrade with no args does not change nim":
+    cleanUp()
+    withPkgListFile:
+      initNewNimblePackage(mainPkgOriginRepoPath, mainPkgRepoPath, @[dep1PkgName])
+      initNewNimblePackage(dep1PkgOriginRepoPath, dep1PkgRepoPath)
+
+      var nimBefore: string
+      cd mainPkgRepoPath:
+        check execNimbleYes("lock").exitCode == QuitSuccess
+        let j = defaultLockFileName.readFile.parseJson
+        nimBefore =
+          if "nim" in j{$lfjkPackages}: j{$lfjkPackages}{"nim"}{$lfjkPkgVcsRevision}.str
+          else: ""
+
+      cd dep1PkgOriginRepoPath:
+        addAdditionalFileToTheRepo("dep1.nim", "echo 1")
+        check execNimbleYes("install").exitCode == QuitSuccess
+        cd mainPkgRepoPath:
+          check execNimbleYes("upgrade").exitCode == QuitSuccess
+          let j2 = defaultLockFileName.readFile.parseJson
+          let nimAfter =
+            if "nim" in j2{$lfjkPackages}: j2{$lfjkPackages}{"nim"}{$lfjkPkgVcsRevision}.str
+            else: ""
+          check nimAfter == nimBefore     # nim unchanged
+
+  test "upgrade with no args is a no-op when already newest":
+    cleanUp()
+    withPkgListFile:
+      initNewNimblePackage(mainPkgOriginRepoPath, mainPkgRepoPath, @[dep1PkgName])
+      initNewNimblePackage(dep1PkgOriginRepoPath, dep1PkgRepoPath)
+      var before: string
+      cd mainPkgRepoPath:
+        check execNimbleYes("lock").exitCode == QuitSuccess
+        before = getRevision(dep1PkgName)
+      cd mainPkgRepoPath:
+        let (_, exitCode) = execNimbleYes("upgrade")     # nothing newer exists
+        check exitCode == QuitSuccess
+        check getRevision(dep1PkgName) == before          # lock unchanged
+
+  test "upgrade with no args realigns a develop dependency":
+    cleanUp()
+    withPkgListFile:
+      initNewNimblePackage(mainPkgOriginRepoPath, mainPkgRepoPath, @[dep1PkgName])
+
+      cdNewDir dep1PkgOriginRepoPath:
+        initRepo()
+        discard dep1PkgOriginRepoPath.initNewNimbleFile()
+        addFiles(dep1PkgNimbleFileName)
+        commit("v0.1.0"); tryDoCmdEx("git tag v0.1.0")
+        writeFile(dep1PkgNimbleFileName, readFile(dep1PkgNimbleFileName).replace("0.1.0", "0.2.0"))
+        commit("v0.2.0"); tryDoCmdEx("git tag v0.2.0")
+
+      clone(dep1PkgOriginRepoPath, dep1PkgRepoPath)
+      var oldRev, newRev: string
+      cd dep1PkgRepoPath:
+        checkout("v0.1.0"); oldRev = getRepoRevision()
+        newRev = tryDoCmdEx("git rev-parse v0.2.0").replace("\n", "")
+      check oldRev != newRev
+
+      cd mainPkgRepoPath:
+        let nf = mainPkgNimbleFileName.readFile
+        mainPkgNimbleFileName.writeFile(nf.replace(&"\"{dep1PkgName}\"", &"\"{dep1PkgName} >= 0.2.0\""))
+        writeDevelopFile(developFileName, @[], @[dep1PkgRepoPath])
+        let res = execNimbleYes("upgrade")
+        check res.exitCode == QuitSuccess
+        var afterRev: string
+        cd dep1PkgRepoPath: afterRev = getRepoRevision()
+        check afterRev == newRev                        # vendor checkout aligned to v0.2.0
+        check getRevision(dep1PkgName) == newRev
+
+  test "upgrade with no args bumps to a newer tagged version":
+    cleanUp()
+    withPkgListFile:
+      initNewNimblePackage(mainPkgOriginRepoPath, mainPkgRepoPath, @[dep1PkgName])
+
+      # dep1 origin starts at version 0.1.0 (one tag).
+      cdNewDir dep1PkgOriginRepoPath:
+        initRepo()
+        discard dep1PkgOriginRepoPath.initNewNimbleFile()   # version 0.1.0
+        addFiles(dep1PkgNimbleFileName)
+        commit("v0.1.0"); tryDoCmdEx("git tag v0.1.0")
+      clone(dep1PkgOriginRepoPath, dep1PkgRepoPath)
+
+      cd mainPkgRepoPath:
+        check execNimbleYes("lock").exitCode == QuitSuccess     # locks dep1 0.1.0
+
+      # dep1 0.2.0 appears upstream and is installed (cache populated).
+      var newRev: string
+      cd dep1PkgOriginRepoPath:
+        writeFile(dep1PkgNimbleFileName,
+          readFile(dep1PkgNimbleFileName).replace("0.1.0", "0.2.0"))
+        commit("v0.2.0"); tryDoCmdEx("git tag v0.2.0")
+        newRev = getRepoRevision()                            # the v0.2.0 commit
+        check execNimbleYes("install").exitCode == QuitSuccess
+        cd mainPkgRepoPath:
+          let (_, exitCode) = execNimbleYes("upgrade")
+          check exitCode == QuitSuccess
+          check getRevision(dep1PkgName) == newRev            # lock bumped to dep1 0.2.0
+
+  test "upgrade with no args does not add nim to a lock that has none":
+    cleanUp()
+    withPkgListFile:
+      initNewNimblePackage(mainPkgOriginRepoPath, mainPkgRepoPath, @[dep1PkgName])
+      initNewNimblePackage(dep1PkgOriginRepoPath, dep1PkgRepoPath)
+
+      cd mainPkgRepoPath:
+        # Drop the `requires "nim >= 1.5.1"` line so nim is never locked.
+        let nf = mainPkgNimbleFileName.readFile
+        mainPkgNimbleFileName.writeFile(nf.replace("requires \"nim >= 1.5.1\"", ""))
+        check execNimbleYes("lock").exitCode == QuitSuccess
+        check "nim" notin defaultLockFileName.readFile.parseJson{$lfjkPackages}
+
+      cd dep1PkgOriginRepoPath:
+        addAdditionalFileToTheRepo("dep1.nim", "echo 1")
+        check execNimbleYes("install").exitCode == QuitSuccess
+        cd mainPkgRepoPath:
+          check execNimbleYes("upgrade").exitCode == QuitSuccess
+          check "nim" notin defaultLockFileName.readFile.parseJson{$lfjkPackages}   # still no nim
+
   test "can upgrade: the new version of the package has a new dep":
     cleanUp()
     withPkgListFile:
@@ -825,7 +1128,9 @@ requires "dep2 >= 0.9.0"
       let requires = nimbleInfo.getRequires(activeFeatures)
       let nimReq = requires.filterIt(it.name == "nim")
       check nimReq.len > 0
-      let expectedNimVersion = $nimReq[0].ver
+      # Read the expectation out of langserver's own nimble file so it follows
+      # whatever they declare upstream.
+      let nimRequirement = nimReq[0].ver
 
       # Remove existing lock file to force regeneration
       removeFile defaultLockFileName
@@ -835,7 +1140,7 @@ requires "dep2 >= 0.9.0"
       check defaultLockFileName.fileExists
       let lockJson = defaultLockFileName.readFile.parseJson
       let nimVersion = lockJson{$lfjkPackages, "nim", "version"}.getStr
-      check nimVersion == expectedNimVersion
+      check newVersion(nimVersion).withinRange(nimRequirement)
 
   test "lock file content is preserved when running nimble lock on existing lock file":
     # Test that running `nimble lock` on an existing lock file preserves:
@@ -1084,3 +1389,83 @@ requires "checksums >= 0.1.0"
 
     # Cleanup
     removeDir(testDir)
+
+  test "package checksum ignores an unrelated parent repository":
+    # A package directory can sit inside a git repository that does not track
+    # it - a package cache under a `$HOME` kept as a dotfiles repo, a vendored
+    # copy dropped into a checkout. There `git ls-files` succeeds and prints
+    # nothing, which is not the same as "this package has no files": the empty
+    # listing used to be hashed as the empty string, so every such package got
+    # the checksum da39a3ee... and lock files stopped being reproducible
+    # between machines.
+    let testDir = getTempDir() / "nimble_test_1840"
+    removeDir(testDir)
+    defer: removeDir(testDir)
+
+    proc writePackage(dir: string) =
+      createDir(dir / "src")
+      writeFile(dir / "pkg.nimble", "version = \"0.1.0\"\n")
+      writeFile(dir / "src" / "pkg.nim", "const answer* = 42\n")
+
+    # The very same content, once nested in a foreign repository and once not.
+    let nestedInRepo = testDir / "foreign" / "nested" / "pkg"
+    createDir(testDir / "foreign")
+    cd testDir / "foreign":
+      discard tryDoCmdEx("git init")
+    writePackage(nestedInRepo)
+
+    let standalone = testDir / "standalone" / "pkg"
+    writePackage(standalone)
+
+    let nestedChecksum = calculateDirSha1Checksum(nestedInRepo)
+
+    # sha1 of no input at all - what hashing the empty listing produced.
+    check $nestedChecksum != "da39a3ee5e6b4b0d3255bfef95601890afd80709"
+    check nestedChecksum == calculateDirSha1Checksum(standalone)
+
+  test "building with a lock file does not re-download commit-pinned deps":
+    # Packages that had a special version (e.g. a commit) would always get redownloaded
+    # since the cache compared the version (e.g. 0.12.0) against the special version (e.g. #12345abcd)
+    cleanUp()
+    
+    withPkgListFile:
+      initNewNimblePackage(dep1PkgOriginRepoPath, dep1PkgRepoPath)
+      var dep1Rev: string
+      cd dep1PkgOriginRepoPath:
+        dep1Rev = getRepoRevision()
+        
+      cdNewDir mainPkgOriginRepoPath:
+        initRepo()
+        writeFile(mainPkgNimbleFileName, &"""
+version       = "0.1.0"
+author        = "Ivan Bobev"
+description   = "A new awesome nimble package"
+license       = "MIT"
+srcDir        = "src"
+bin           = @["main"]
+requires "nim >= 2.0.0"
+requires "{dep1PkgName}#{dep1Rev}"
+""")
+        createDir("src")
+        writeFile("src" / "main.nim", "echo \"hello\"\n")
+        addFiles(mainPkgNimbleFileName, "src" / "main.nim")
+        commit("Initial commit")
+
+      clone(mainPkgOriginRepoPath, mainPkgRepoPath)
+      
+      cd mainPkgRepoPath:
+        # `nimble lock` writes nimble.lock with dep1 pinned to `#<rev>` and its
+        # setup phase installs dep1 into pkgs2 under its declared version.
+        let (_, lockExitCode) = execNimbleYes("lock")
+        check lockExitCode == QuitSuccess
+        check fileExists(defaultLockFileName)
+        let lockJson = defaultLockFileName.readFile.parseJson
+        check lockJson{$lfjkPackages}{dep1PkgName}{$lfjkVersion}.str ==
+          "#" & dep1Rev
+        check packageDirExists(pkgsDir, dep1PkgName & "-0.1.0-")
+        
+        # A build with the warm cache must reuse the installed dep instead of
+        # re-downloading it.
+        let (output, exitCode) = execNimbleYes("build")
+        check exitCode == QuitSuccess
+        check not output.contains(&"Downloading {dep1PkgOriginRepoPath}")

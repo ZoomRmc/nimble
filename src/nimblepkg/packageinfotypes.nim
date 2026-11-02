@@ -1,4 +1,4 @@
-# Copyright (C) Dominik Picheta. All rights reserved.
+# Copyright (C) the Nimble contributors. All rights reserved.
 # BSD License. Look at license.txt for more info.
 
 import std/[sets, tables, strformat, options, os]
@@ -81,7 +81,7 @@ type
     metaData*: PackageMetaData
     paths*: seq[string] 
     entryPoints*: seq[string] #useful for tools like the lsp.
-    features*: Table[string, seq[PkgTuple]] #features requires defined in the nimble file. Declarative parser + SAT solver only.
+    features*: Table[string, seq[PkgTuple]] #Feature requirements defined in the nimble file.
     activeFeatures*: Table[PkgTuple, seq[string]] #features that dependencies of this package have activated. #i.e. requires package[feature1, feature2]
     testEntryPoint*: string ## The entry point for the test task.
     declarativeParserErrors*: seq[string] ## Errors from declarative parser (shown only for packages in solution)
@@ -153,7 +153,7 @@ type
     normalizedRequirements*: Table[string, string] #normalized -> old. Some packages are not published as nimble packages, we keep the url for installation.
     pkgVersionTable*: Table[string, PackageVersions]
     gitErrors*: seq[string] # Git errors encountered during package discovery (could be network, auth, etc.)
-    lockFileVcsRevisions*: Table[string, Sha1Hash] # package name -> vcsRevision from lock file, for exact commit matching
+    lockFileDeps*: Table[string, LockFileDep] # package name -> source information from the lock file
 
   PackageDownloadInfo* = object
     meth*: Option[DownloadMethod] #None for file dependencies. File dependencies are not copied over to the cache
@@ -223,7 +223,7 @@ proc initSATResult*(pass: SATPass): SATResult =
     pass: pass, installedPkgs: @[],
     normalizedRequirements: initTable[string, string](),
     gitErrors: @[],
-    lockFileVcsRevisions: initTable[string, Sha1Hash]()
+    lockFileDeps: initTable[string, LockFileDep]()
     )
 
 proc getNimbleFileDir*(pkgInfo: PackageInfo): string =

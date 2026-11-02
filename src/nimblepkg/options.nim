@@ -5,7 +5,8 @@ import strutils, os, parseopt, uri, tables, terminal, strscans, strformat
 import compat/json
 import sequtils, sugar
 import std/options as std_opt
-from httpclient import Proxy, newProxy
+
+import chronos/apps/http/httpclient
 
 import compat/osproc
 
@@ -23,6 +24,16 @@ type
     version*: Version
 
   DumpMode* = enum kdumpIni, kdumpJson
+
+  ResolutionAlgorithm* = enum
+    ## How the SAT solver picks among versions satisfying a requirement.
+    raMinVer   ## lowest satisfying version (minimal version selection)
+    raMaxVer   ## newest satisfying version (default)
+
+  SolverKind* = enum
+    ## Which algorithm resolves the dependency graph (`--solver`).
+    skSat = "sat"           ## the SAT solver (default)
+    skPubGrub = "pubgrub"   ## PubGrub; same version preference as SAT
 
   VisitedHook* = object
     pkgName*: string #just the nimble file name
@@ -56,6 +67,8 @@ type
                       # some commands, useful when processing deps
     nimBin*: Option[NimBin]
     localdeps*: bool # True if project local deps mode
+    resolutionAlgorithm*: ResolutionAlgorithm # How SAT picks among satisfying versions
+    solver*: SolverKind # Which algorithm resolves the dependency graph
     developLocaldeps*: bool # True if local deps + nimble develop pkg1 ...
     disableSslCertCheck*: bool
     disableLockFile*: bool
@@ -81,7 +94,8 @@ type
     parallelDiscovery*: bool # When true (default), downloads and version discovery happen in parallel. Disabled with --sync
     explicitGlobal*: bool # Whether -g/--global was explicitly passed by the user
     lenient*: bool # When true, conflicting special versions produce warnings. When false, they error. For now it cant be disabled.
-    
+    forceFetch*: bool # When true, version discovery always git-fetches the repo instead of trusting the tagged versions cache. Set by `nimble refresh`.
+
   ActionType* = enum
     actionNil, actionRefresh, actionInit, actionDump, actionPublish, actionUpgrade
     actionInstall, actionSearch, actionList, actionBuild, actionPath,
@@ -103,6 +117,8 @@ type
       listOnly*: bool
     of actionRefresh:
       optionalURL*: string # Overrides default package list.
+      packageListOnly*: bool # Only refresh the package list(s), skip the
+                             # current project's dependency clones.
     of actionInstall, actionPath, actionUninstall, actionDevelop, actionUpgrade, actionLock, actionAdd:
       packages*: seq[PkgTuple] # Optional only for actionInstall,
                                # actionDevelop and actionAdd.
@@ -119,6 +135,9 @@ type
       onlyNimBinaries*: bool
       onlyInstalled*: bool
       showListVersions*: bool
+      listPackages*: seq[PkgTuple] # Restrict the listing to these packages.
+                                   # Empty means list everything. A version
+                                   # range narrows the versions shown.
     of actionInit, actionDump:
       projName*: string
       vcsOption*: string
@@ -143,7 +162,9 @@ type
       depsAction*: string
     of actionPublish:
       publishAction*: string
-    of actionShellEnv, actionShell:
+    of actionShell:
+      shellCommand*: seq[string]
+    of actionShellEnv:
       discard
 
 const
@@ -182,11 +203,6 @@ Commands:
          [-e, --exclude file]     Excludes a develop file from a specified
                                   develop file or from `nimble.develop` if not
                                   specified and executed in package's directory.
-         [-g, --global]           Creates an old style link file in the special
-                                  `links` directory. It is read by Nim to be
-                                  able to use global develop mode packages.
-                                  Nimble uses it as a global develop file if a
-                                  local one does not exist.
   check                           Verifies the validity of a package in the
                                   current working directory.
   init         [pkgname]          Initializes a new Nimble project in the
@@ -216,11 +232,23 @@ Commands:
   doc, doc2    [opts, ...] f.nim  Builds documentation for a file inside a
                                   package. Passes options to the Nim compiler.
   refresh      [url]              Refreshes the package list. A package list URL
-                                  can be optionally specified.
+                                  can be optionally specified. Inside a package,
+                                  also fetches the repos of its dependencies and
+                                  reports which newer versions became available.
+                                  Outside a package it does that for every
+                                  globally known package instead.
+       [-g, --global]             Refresh every globally known package rather
+                                  than the current project's dependencies.
+       [--packageListOnly]        Only refresh the package list, leaving the
+                                  dependency clones untouched.
   search       pkg/tag            Searches for a specified package. Search is
                                   performed by tag and by name.
                [--ver, --version] Queries remote server for package version.
-  list                            Lists all packages.
+  list         [pkgname, ...]     Lists all packages, or only the named ones
+                                  when package names are given. A name may
+                                  carry a version range, spelled as in a
+                                  requires line, to narrow the versions shown
+                                  (implies --ver): nimble list "chronos >= 4.0.4"
                [-i, --installed]  Lists all installed packages.
                [--ver, --version] Also display versions for packages.
                [-n, --nimbinaries]  Lists all installed packages.
@@ -235,8 +263,15 @@ Commands:
                [--ini, --json]    Selects the output format (the default is --ini). Only applicable to package information.
                [--collect]        Collects all the packages in the dependency tree of the given package and shows the result in the console.
                [--solve]          Solves the dependency tree of the given package and shows the result in the console.
-  lock                            Generates or updates a package lock file.
-  upgrade      [pkgname, ...]     Upgrades a list of packages in the lock file.
+  lock         [pkgname, ...]     Generates or updates a package lock file.
+                                  Every pin is kept unless the package's
+                                  requirements changed. Naming packages relocks
+                                  those and leaves the rest of the file pinned.
+       [--refresh]                Resolve against the package repositories
+                                  instead of the cached version information, so
+                                  newly published versions are picked up. With
+                                  no package named, relocks everything.
+  upgrade      [pkgname, ...]     Deprecated alias of `lock --refresh`.
   deps                            Outputs dependencies for current package.
                [--tree]           Outputs dependency tree.
                [--inverted]       Outputs inverted (reversed) dependency tree.
@@ -250,8 +285,9 @@ Commands:
                                   system paths to the dependencies. Also
                                   includes the paths file in the `config.nims`
                                   file to make them available for the compiler.
-  shell                           Creates a new shell with PATH modified to contain
-                                  the bin folders of the dependencies.
+  shell     [command [args...]]   Runs a command with PATH modified to contain
+                                  the bin folders of the dependencies. Without a
+                                  command, creates a new shell instead.
   shellenv                        Similar to shell command but it returns the script to run in
                                   order to alter the environment. This is intended to be
                                   used in scripts.
@@ -263,6 +299,11 @@ Nimble Options:
   -n, --reject                    Reject all interactive prompts.
   -l, --localdeps                 Run in project local dependency mode.
   -g, --global                    Run in global dependency mode.
+      --resolver:minver|maxver    Pick the lowest (minver) or newest (maxver,
+                                  default) version satisfying each requirement.
+      --solver:sat|pubgrub        The algorithm that resolves the dependency
+                                  graph: the SAT solver (sat, default) or
+                                  PubGrub (pubgrub).
   -p, --package                   For which package in the dependency tree the
                                   command should be executed. If not provided by
                                   default it applies to the current directory
@@ -291,9 +332,12 @@ Nimble Options:
       --disableNimBinaries        Disable the use of nim precompiled binaries. Note in some platforms precompiled binaries are not available but the flag can still be used to avoid compile the Nim version once and reuse it.
       --maximumTaggedVersions     Maximum number of tags to check for a package when discovering versions for the SAT solver. 0 means all.
       --parser:declarative|nimvm  Use the declarative parser or the nimvm parser (default).
-      --features                  Activate features. Only used when using the declarative parser.
+      --features                  Activate package features.
       --ignoreSubmodules          Ignore submodules when cloning a repository.
       --sync                       Disable parallel downloads and version discovery.
+      --refresh                   Resolve against the package repositories
+                                  instead of the cached version information,
+                                  so newly published versions are picked up.
 For more information read the GitHub readme:
   https://github.com/nim-lang/nimble#readme
 """
@@ -463,11 +507,26 @@ proc nim*(options: Options): string =
 proc getNimbleDir*(options: Options): string =
   return options.nimbleDir
 
+proc isUpgrade*(options: Options): bool =
+  ## Whether this run should relock rather than keep what the lock file pins.
+  ##
+  ## Two things ask `lock` to move a pin
+  ##
+  ## * naming packages - `nimble lock foo` relocks `foo` and leaves the rest of
+  ##   the lock file alone.
+  ## * `--refresh` - go look at the remotes first, instead of resolving against
+  ##   the tagged versions cache. With no packages named that means relocking
+  ##   everything to the newest available.
+  ##
+  ## So `nimble lock foo --refresh` fetches and then relocks just `foo`, and
+  ## plain `nimble lock` keeps every pin. `nimble upgrade` is the deprecated
+  ## spelling of `lock --refresh`.
+  options.action.typ == actionUpgrade or
+  (options.action.typ == actionLock and
+   (options.forceFetch or options.action.packages.len > 0))
+
 proc getPkgsDir*(options: Options): string =
   options.getNimbleDir() / nimblePackagesDirName
-
-proc getPkgsLinksDir*(options: Options): string =
-  options.getNimbleDir() / nimblePackagesLinksDirName
 
 proc getBinDir*(options: Options): string =
   options.getNimbleDir() / nimbleBinariesDirName
@@ -544,6 +603,18 @@ proc thereIsNimbleFile*(options: Options): bool =
     return false
   return findNimbleFile(cwd, error = false, options, warn = false) != ""
 
+proc prependNimBinDirToPath*(nimBinDir: string) =
+  ## Puts the selected nim's `bin` directory in front of PATH so subprocesses
+  ## (tasks, hooks, `exec`) pick that nim up. Nim distributions ship their own
+  ## `nimble` next to `nim`, so the running nimble's directory goes in front of
+  ## it: otherwise anything resolving `nimble` through PATH (shells,
+  ## `cmd /c ...`) gets the bundled - usually older - one (#1840).
+  ##
+  ## This does not cover NimScript's `exec`: it looks in the running nim's own
+  ## directory before PATH, which is why `installNimToPkgs2` leaves the bundled
+  ## nimble out of nimble-managed nim installs altogether.
+  putEnv("PATH", getAppDir() & PathSep & nimBinDir & PathSep & getEnv("PATH"))
+
 proc setNimbleDir*(options: var Options) =
   var
     nimbleDir = options.config.nimbleDir
@@ -566,6 +637,11 @@ proc setNimbleDir*(options: var Options) =
   var isActionGlobal = false
   if options.action.typ == actionInstall:
     isActionGlobal = options.action.global
+  elif options.action.typ == actionRefresh:
+    # `nimble refresh -g` refreshes the globally installed packages, so it has
+    # to look at the global package dir even when run from inside a project
+    # that keeps its dependencies in nimbledeps.
+    isActionGlobal = options.explicitGlobal
 
   if options.nimbleDir.len != 0:
     # --nimbleDir:<dir> takes priority...
@@ -581,7 +657,7 @@ proc setNimbleDir*(options: var Options) =
     let env = getEnv("NIMBLE_DIR")
     if env.len != 0:
       display("Info:", "Using the environment variable: NIMBLE_DIR='" &
-              env & "'", Success, priority = HighPriority)
+              env & "'", DisplayType.Success, priority = HighPriority)
       nimbleDir = env
       setPackageCache(options, options.config.nimbleDir) #Use the global nimbleDir so pkgcache is shared
     else:
@@ -622,6 +698,13 @@ proc setNimbleDir*(options: var Options) =
 proc parseCommand*(key: string, result: var Options) =
   result.action = Action(typ: parseActionType(key))
   initAction(result, key)
+  # `nimble upgrade` is a deprecated alias of `nimble lock --refresh`. Set
+  # forceFetch here - at parse time, before the SAT solver runs - so version
+  # discovery goes to the remotes (not the tagged-versions cache) for the whole
+  # run. Setting it later, in the action dispatch, would be too late: the
+  # solver would already have resolved dependencies from the cache.
+  if result.action.typ == actionUpgrade:
+    result.forceFetch = true
 
 
 proc getRequiredNimVersion*(pkgInfo: PackageInfo): VersionRange =
@@ -643,7 +726,8 @@ proc parseArgument*(key: string, result: var Options) =
   case result.action.typ
   of actionNil:
     assert false
-  of actionInstall, actionPath, actionDevelop, actionUninstall, actionUpgrade, actionAdd:
+  of actionInstall, actionPath, actionDevelop, actionUninstall, actionUpgrade,
+     actionLock, actionAdd:
     # Parse pkg@verRange or git@github.com:nim-lang/nimble.git
     # First trim whitespace from the key
     let trimmedKey = key.strip()
@@ -688,7 +772,11 @@ proc parseArgument*(key: string, result: var Options) =
     result.action.projName = key
   of actionCompile, actionDoc:
     result.action.file = key
-  of actionList, actionPublish:
+  of actionList:
+    # Same spelling as a `requires` line, so `nimble list "chronos >= 4.0.4"`
+    # reads like the dependency it would become.
+    result.action.listPackages.add parseRequires(key)
+  of actionPublish:
     result.showHelp = true
   of actionBuild:
     result.action.file = key
@@ -711,7 +799,7 @@ proc getFlagString(kind: CmdLineKind, flag, val: string): string =
     return prefix & flag & ":" & val
 
 proc getNimVersionFromBin*(nimBin: string): Option[Version] =
-  let cmd = nimBin & " --version"
+  let cmd = nimBin.quoteShell & " --version"
   if nimBin.fileExists:
     let info = execProcess(cmd)
     var major, minor, patch: int
@@ -801,9 +889,46 @@ proc parseFlag*(flag, val: string, result: var Options, kind = cmdLongOption) =
     result.ignoreSubmodules = true
   of "sync":
     result.parallelDiscovery = false
+  of "refresh":
+    # Resolve against the remotes instead of the tagged versions cache, for the
+    # commands whose answer depends on how fresh that cache is. `nimble refresh`
+    # sets the same field; this is that behaviour as a flag.
+    result.forceFetch = true
   of "lenient":
     result.lenient = true
+  of "resolver":
+    # `--resolver:minver|maxver` chooses how SAT picks among satisfying versions.
+    case val.normalize
+    of "minver", "min": result.resolutionAlgorithm = raMinVer
+    of "maxver", "max", "": result.resolutionAlgorithm = raMaxVer
+    else:
+      raise nimbleError("Unknown resolver '" & val &
+        "'. Valid values: minver, maxver.")
+  of "solver":
+    # `--solver:sat|pubgrub` chooses the algorithm that resolves the graph.
+    case val.normalize
+    of "sat": result.solver = skSat
+    of "pubgrub": result.solver = skPubGrub
+    else:
+      raise nimbleError("Unknown solver '" & val &
+        "'. Valid values: sat, pubgrub.")
   else: isGlobalFlag = false
+
+  # Reject a value given to a global boolean flag, e.g. `-l:-static` or
+  # `--localdeps:foo`. Without this such a flag silently sets the boolean and
+  # drops the value (issue #1037). Only flags whose every meaning is valueless
+  # are listed — `n` (global reject AND develop remove-by-name) and `parser`
+  # (`--parser:declarative`, value discarded) are intentionally excluded so
+  # legitimate `flag:value` uses keep working.
+  const valuelessGlobalFlags = [
+    "help", "h", "version", "v", "accept", "y", "reject",
+    "silent", "info", "verbose", "debug", "offline", "nocolor",
+    "disablevalidation", "localdeps", "local", "l", "global", "g",
+    "nosslcheck", "nolockfile", "tarballs", "t", "usesystemnim",
+    "disablenimbinaries", "ignoresubmodules", "sync", "lenient", "refresh"]
+  if isGlobalFlag and val.len > 0 and f in valuelessGlobalFlags:
+    raise nimbleError("The flag '" & getFlagString(kind, flag, "") &
+      "' does not take a value (got '" & val & "').")
 
   var wasFlagHandled = true
   # Action-specific flags.
@@ -904,6 +1029,12 @@ proc parseFlag*(flag, val: string, result: var Options, kind = cmdLongOption) =
       result.action.listOnly = true
     else:
       wasFlagHandled = false
+  of actionRefresh:
+    case f
+    of "packagelistonly":
+      result.action.packageListOnly = true
+    else:
+      wasFlagHandled = false
   of actionPublish:
     case f
     of "tags":
@@ -939,7 +1070,9 @@ proc initOptions*(): Options =
     # TEMPORARY: Changed to global-by-default. To revert to local-by-default, change to: localDeps: true
     localDeps: false,
     parallelDiscovery: true,
-    lenient: true
+    lenient: true,
+    resolutionAlgorithm: raMaxVer,  # enum defaults to raMinVer; force the historical default
+    solver: skSat
   )
 
   # Load visited hooks from environment variable to prevent recursive hook execution
@@ -984,11 +1117,17 @@ proc parseCmdLine*(): Options =
 
   # Parse command line params first. A simple `--version` shouldn't require
   # a config to be parsed.
-  for kind, key, val in getOpt():
+  var parser = initOptParser()
+  for kind, key, val in parser.getOpt():
     case kind
     of cmdArgument:
       if result.action.typ == actionNil:
         parseCommand(key, result)
+        if result.action.typ == actionShell:
+          # Everything after `shell` belongs to the command, including flags
+          # that would otherwise be interpreted as Nimble options.
+          result.action.shellCommand = parser.remainingArgs()
+          break
       else:
         parseArgument(key, result)
     of cmdLongOption, cmdShortOption:
@@ -1014,35 +1153,37 @@ proc parseCmdLine*(): Options =
     # nimble run foobar -v
     result.showVersion = false
 
-proc getProxy*(options: Options): Proxy =
-  ## Returns ``nil`` if no proxy is specified.
-  var url = ""
-  if ($options.config.httpProxy).len > 0:
-    url = $options.config.httpProxy
+proc getProxyUrl*(proxyConfig = ""): Opt[string] =
+  ## Checks configProxy if non-empty, then falls through to env vars.
+  if len(proxyConfig) > 0:
+    ok(proxyConfig)
   else:
     try:
       if existsEnv("http_proxy"):
-        url = getEnv("http_proxy")
+        ok(getEnv("http_proxy"))
       elif existsEnv("https_proxy"):
-        url = getEnv("https_proxy")
+        ok(getEnv("https_proxy"))
       elif existsEnv("HTTP_PROXY"):
-        url = getEnv("HTTP_PROXY")
+        ok(getEnv("HTTP_PROXY"))
       elif existsEnv("HTTPS_PROXY"):
-        url = getEnv("HTTPS_PROXY")
+        ok(getEnv("HTTPS_PROXY"))
+      else:
+        Opt.none(string)
     except ValueError:
       display("Warning:", "Unable to parse proxy from environment: " &
           getCurrentExceptionMsg(), Warning, HighPriority)
+      Opt.none(string)
 
-  if url.len > 0:
-    var parsed = parseUri(url)
-    if parsed.scheme.len == 0 or parsed.hostname.len == 0:
-      parsed = parseUri("http://" & url)
-    let auth =
-      if parsed.username.len > 0: parsed.username & ":" & parsed.password
-      else: ""
-    return newProxy($parsed, auth)
-  else:
-    return nil
+proc getProvider*(configProxy = ""): HttpConnectionProvider =
+  ## Creates an HttpConnectionProvider from a proxy URL (env var or config).
+  ## Returns nil when no proxy is configured.
+  let
+    proxyUrl = getProxyUrl(configProxy).valueOr:
+      return nil
+    addrRes = getHttpAddress(parseUri(proxyUrl)).valueOr:
+      return nil
+
+  httpProxyProvider(addrRes)
 
 proc shouldRemoveTmp*(options: Options, file: string): bool =
   result = true

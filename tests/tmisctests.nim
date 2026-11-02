@@ -1,4 +1,4 @@
-# Copyright (C) Dominik Picheta. All rights reserved.
+# Copyright (C) the Nimble contributors. All rights reserved.
 # BSD License. Look at license.txt for more info.
 
 {.used.}
@@ -113,6 +113,112 @@ suite "misc tests":
   test "can list":
     check execNimble("list").exitCode == QuitSuccess
     check execNimble("list", "-i").exitCode == QuitSuccess
+
+  test "list with a package name shows only that package (#1825)":
+    usePackageListFile "develop/packages.json":
+      let (output, exitCode) = execNimble("list", "packagea")
+      checkpoint output
+      check exitCode == QuitSuccess
+      check output.contains("packagea:")
+      check not output.contains("packageb:")
+
+  test "list matches the package name case insensitively (#1825)":
+    usePackageListFile "develop/packages.json":
+      let (output, exitCode) = execNimble("list", "PackageA")
+      checkpoint output
+      check exitCode == QuitSuccess
+      check output.contains("packagea:")
+
+  test "list accepts several package names (#1825)":
+    usePackageListFile "develop/packages.json":
+      let (output, exitCode) = execNimble("list", "packagea", "packageb")
+      checkpoint output
+      check exitCode == QuitSuccess
+      check output.contains("packagea:")
+      check output.contains("packageb:")
+
+  test "list with an unknown package name fails (#1825)":
+    usePackageListFile "develop/packages.json":
+      let (output, exitCode) = execNimble("list", "nosuchpackage")
+      checkpoint output
+      check exitCode == QuitFailure
+      check output.contains("nosuchpackage")
+
+  test "list with a package name and --ver shows its versions (#1825)":
+    usePackageListFile "develop/packages.json":
+      let (output, exitCode) = execNimble("list", "packagea", "--ver")
+      checkpoint output
+      check exitCode == QuitSuccess
+      check output.contains("packagea:")
+      check output.contains("versions:")
+      check not output.contains("packageb:")
+
+  test "list -i with a package name shows only that package (#1825)":
+    check execNimbleYes("install", pkgAUrl).exitCode == QuitSuccess
+    check execNimbleYes("install", pkgBin2Url).exitCode == QuitSuccess
+
+    # The installed package names keep their original casing (`PackageA`), so
+    # compare case insensitively — the lookup itself is case insensitive too.
+    let (all, allExitCode) = execNimble("list", "-i")
+    checkpoint all
+    check allExitCode == QuitSuccess
+    check all.toLower.contains("packagea")
+    check all.toLower.contains("packagebin2")
+
+    let (output, exitCode) = execNimble("list", "-i", "packagea")
+    checkpoint output
+    check exitCode == QuitSuccess
+    check output.toLower.contains("packagea")
+    check not output.toLower.contains("packagebin2")
+
+  test "list filters versions by a version range (#1825)":
+    # packagea is tagged v0.1, v0.2, v0.3 and v0.5. A range implies --ver,
+    # since asking about versions is the whole point of giving one.
+    usePackageListFile "develop/packages.json":
+      let (output, exitCode) = execNimble("list", "packagea >= 0.3")
+      checkpoint output
+      check exitCode == QuitSuccess
+      check output.contains("packagea:")
+      check output.contains("versions:")
+      check output.contains("v0.5")
+      check output.contains("v0.3")
+      check not output.contains("v0.2")
+      check not output.contains("v0.1")
+
+  test "list with a version range matching nothing lists no versions (#1825)":
+    usePackageListFile "develop/packages.json":
+      let (output, exitCode) = execNimble("list", "packagea >= 99.0")
+      checkpoint output
+      check exitCode == QuitSuccess
+      check output.contains("packagea:")
+      check not output.contains("v0.")
+
+  test "list accepts an exact version as a range (#1825)":
+    usePackageListFile "develop/packages.json":
+      let (output, exitCode) = execNimble("list", "packagea == 0.2")
+      checkpoint output
+      check exitCode == QuitSuccess
+      check output.contains("v0.2")
+      check not output.contains("v0.5")
+
+  test "list -i filters installed versions by a version range (#1825)":
+    check execNimbleYes("install", pkgAUrl).exitCode == QuitSuccess
+
+    let (hit, hitExitCode) = execNimble("list", "-i", "packagea >= 0.4")
+    checkpoint hit
+    check hitExitCode == QuitSuccess
+    check hit.contains("@0.5.0")
+
+    let (miss, missExitCode) = execNimble("list", "-i", "packagea >= 99.0")
+    checkpoint miss
+    check missExitCode == QuitSuccess
+    check not miss.contains("@0.5.0")
+
+  test "list -i with a package name that is not installed fails (#1825)":
+    let (output, exitCode) = execNimble("list", "-i", "nosuchpackage")
+    checkpoint output
+    check exitCode == QuitFailure
+    check output.contains("nosuchpackage")
 
   test "should not install submodules when --ignoreSubmodules flag is on":
     cleanDir(installDir)
@@ -273,6 +379,39 @@ echo "hello"
       check output.contains("jsony")
       # root package should NOT be installed
       check not output.contains("tester installed successfully")
+
+    removeDir(testDir)
+
+  test "install pkg from inside a binary package does not install the current package":
+    # Regression test for https://github.com/nim-lang/nimble/issues/1721
+    # When running `nimble install <pkg>` from inside a binary nimble package,
+    # nimble was incorrectly adding the current project to the install list.
+    let testDir = getTempDir() / "nimble_test_install_from_binary_pkg"
+    removeDir(testDir)
+    createDir(testDir)
+
+    writeFile(testDir / "testapp.nimble", """
+version = "0.1.0"
+author = "test"
+description = "test"
+license = "MIT"
+srcDir = "."
+bin = @["testapp"]
+
+requires "nim >= 2.0.0"
+""")
+    writeFile(testDir / "testapp.nim", """
+echo "hello"
+""")
+
+    cleanDir(installDir)
+    cd testDir:
+      let (output, exitCode) = execNimbleYes("--nimbleDir:" & installDir, "install", "unicodedb")
+      check exitCode == QuitSuccess
+      # unicodedb (the requested package) should be installed
+      check output.contains("unicodedb")
+      # The current binary package should NOT be installed into pkgs2
+      check not packageDirExists(installDir / nimblePackagesDirName, "testapp")
 
     removeDir(testDir)
 

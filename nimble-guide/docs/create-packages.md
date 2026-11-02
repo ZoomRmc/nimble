@@ -21,7 +21,7 @@ $ nimble init
         ... Library - provides functionality for other packages.
         ... Binary  - produces an executable for the end-user.
         ... Hybrid  - combination of library and binary
-        ... For more information see https://goo.gl/cm2RX5
+        ... For more information see https://nim-lang.github.io/nimble/package-types.html
      Select Cycle with 'Tab', 'Enter' when done
    Choices:> library <
              binary  
@@ -250,21 +250,28 @@ There are two ways to activate a feature:
    requires "awesomeAsyncPackage[chronos]"
    ```
 
-Multiple features can be activated for a package as follows:  
-```nim
-requires "awesomeAsyncPackage[chronos, feature2]"
-```
+Multiple features can be activated for a package as follows:
+
+1. By passing multiple features with the `--features`, separated by semicolons:
+   ```sh
+   nimble --features:"chronos;feature2" install
+   ```
+   Note that you may need to protect the semicolons from being interpreted by your shell by quoting the feature list argument value.
+2. By listing several features separated by commas using the `[]` operator:
+   ```nim
+   requires "awesomeAsyncPackage[chronos, feature2]"
+   ```
 
 #### Checking Active Features in Code
 
 In Nim code, you can check if a given feature is activated using the `when` operator:
 
 ```nim
-when defined(feature.awesomeAsyncPackage.chronos):
+when defined(features.awesomeAsyncPackage.chronos):
   import chronos
 ```
 
-The format follows: `feature.packageName.featureName`.
+The format follows: `features.packageName.featureName`.
 
 ---
 

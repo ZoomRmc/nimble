@@ -1,9 +1,10 @@
 ## Nim binary discovery, bootstrap, and SAT-driven Nim selection.
 
-import std/[sequtils, sets, options, os, strutils, algorithm]
-import nimblesat, packageinfotypes, options, version, declarativeparser,
-       packageinfo, common, lockfile, cli, downloadnim, tools,
+import std/[sequtils, sets, options, os, strutils, algorithm, tables]
+import nimblesolver, packageinfotypes, options, version, declarativeparser,
+       packageinfo, common, lockfile, downloadnim, tools,
        packageinstaller
+import chronos
 
 when defined(windows):
   import std/strscans
@@ -44,9 +45,35 @@ proc getNimFromSystem*(options: Options): Option[PackageInfo] =
       var pkgInfo = getPkgInfo(dir, options, nimBin = none(string), level = pikRequires) #Can be empty as the code path for nim doesnt need it.
       pkgInfo.nimBinPath = some pnim  # preserve the PATH-resolved binary for later use
       return some pkgInfo
-    except CatchableError:
-      discard # Fall back to original pnim
+    except NimbleError:
+      # findNimbleFile raises NimbleError when there is no parseable nim.nimble
+      # for this layout (missing/absent file); synthesize one from the binary
+      # below. See #1757.
+      discard
+    except CatchableError as e:
+      # Any other failure while reading the system nim is unexpected — surface it
+      # with context instead of silently synthesizing over it.
+      raise nimbleError("Error reading system nim at " & dir & ": " & e.msg, details = e)
+    # Distro packages (e.g. Debian's apt `nim`) install the compiler at
+    # /usr/bin/nim and the stdlib at /usr/lib/nim, with no nim.nimble anywhere,
+    # so getPkgInfo above can't reconstruct a package. We still have a usable nim
+    # on PATH, so build a minimal package straight from the binary. See #1757.
+    let nimVer = getNimVersionFromBin(pnim)
+    if nimVer.isSome:
+      var pkgInfo = initPackageInfo(options, dir / "nim.nimble")
+      pkgInfo.basicInfo.version = nimVer.get
+      pkgInfo.nimBinPath = some pnim  # preserve the PATH-resolved binary for later use
+      return some pkgInfo
   return none(PackageInfo)
+
+proc checkMayInstallNim(options: Options) =
+  ## `nimble dump` is a read-only command: it may report which Nim it would use,
+  ## but it must never download or install one (#1857). Raised as a
+  ## ResolutionFailureError so `getNimDir` turns it into an empty `nimDir`, the
+  ## documented "couldn't pick a nim" signal for the langserver.
+  if options.action.typ == actionDump:
+    raise resolutionFailureError(
+      "No Nim is available and `nimble dump` must not install one")
 
 proc isSystemNim*(resolvedNim: NimResolved, options: Options): bool =
   if resolvedNim.pkg.isSome:
@@ -62,9 +89,12 @@ proc solvePackagesWithSystemNimFallback*(
     resolvedNim: Option[NimResolved], nimBin: Option[string]): HashSet[PackageInfo] {.instrument.} =
   ## Solves packages with system Nim as a hard requirement, falling back to
   ## solving without it if the first attempt fails due to unsatisfiable dependencies.
+  ## Under `--solver:pubgrub` the system Nim is a preference instead, so a
+  ## single solve both tries it first and gives it up when nothing works with it.
 
   var rootPackageWithSystemNim = rootPackage
   var systemNimPass = false
+  var preferred = initTable[string, Version]()
 
   # If there is systemNim, we will try to do a first pass with the systemNim
   # as a hard requirement. If it fails, we will fallback to
@@ -74,15 +104,26 @@ proc solvePackagesWithSystemNimFallback*(
   # doesn't match system nim — the pass would be guaranteed to fail.
   if resolvedNim.isSome and resolvedNim.get.isSystemNim(options):
     let nimReqs = rootPackage.requires.filterIt(it.name.isNim)
-    let exactMismatch = nimReqs.anyIt(
-      it.ver.kind == verEq and it.ver.ver != resolvedNim.get.version)
-    if not exactMismatch:
-      rootPackageWithSystemNim.requires.add(parseRequires("nim " & $resolvedNim.get.version))
-      systemNimPass = true
+    if options.solver == skPubGrub:
+      # Nothing to prefer if the root itself rules the system Nim out. The
+      # root asks for some Nim, so Nim is decided before the packages whose
+      # versions depend on it.
+      if nimReqs.allIt(resolvedNim.get.version.satisfiesConstraint(it.ver)):
+        if nimReqs.len == 0:
+          rootPackageWithSystemNim.requires.add(parseRequires("nim"))
+        preferred["nim"] = resolvedNim.get.version
+    else:
+      let exactMismatch = nimReqs.anyIt(
+        it.ver.kind in {verEq, verSpecial} and
+          not resolvedNim.get.version.satisfiesConstraint(it.ver))
+      if not exactMismatch:
+        rootPackageWithSystemNim.requires.add(parseRequires("nim " & $resolvedNim.get.version))
+        systemNimPass = true
 
   result = solvePackages(rootPackageWithSystemNim, pkgList,
                         options.satResult.pkgsToInstall, options,
-                        options.satResult.output, options.satResult.solvedPkgs, nimBin)
+                        options.satResult.output, options.satResult.solvedPkgs, nimBin,
+                        preferred)
   if options.satResult.solvedPkgs.len == 0 and systemNimPass:
     # If the first pass failed, we will retry without the systemNim as a hard requirement
     result = solvePackages(rootPackage, pkgList,
@@ -127,7 +168,8 @@ proc resolveNim*(rootPackage: PackageInfo, pkgListDecl: seq[PackageInfo], system
 
     #TODO look in the installed binaries dir
     #If none is found return the latest version by looking at getOfficialReleases
-    raise newNimbleError[NimbleError]("No Nim found in lock file and no Nim in the system")
+    raise resolutionFailureError(
+      "No Nim found in lock file and no Nim in the system")
 
     #Then latest nim release
     # let latestNim = getLatestNimRelease()
@@ -141,8 +183,9 @@ proc resolveNim*(rootPackage: PackageInfo, pkgListDecl: seq[PackageInfo], system
     nimBin = some(resolvedNim.get.getNimBin())
   else:
     if options.satResult.bootstrapNim.nimResolved.pkg.isNone:
+      options.checkMayInstallNim()
       let nimPkg = (name: "nim", ver: parseVersionRange(options.satResult.bootstrapNim.nimResolved.version))
-      let nimInstalled = installNimFromBinariesDir(nimPkg, options)
+      let nimInstalled = waitFor installNimFromBinariesDir(nimPkg, options)
       if nimInstalled.isSome:
         options.satResult.bootstrapNim.nimResolved.pkg = some getPkgInfo(nimInstalled.get.dir, options, nimBin = none(string), level = pikRequires) #Can be empty as the code path for nim doesnt need it.
       else:
@@ -152,8 +195,7 @@ proc resolveNim*(rootPackage: PackageInfo, pkgListDecl: seq[PackageInfo], system
   options.satResult.pkgs = solvePackagesWithSystemNimFallback(
       rootPackage, pkgListDecl, options,  resolvedNim, nimBin)
   if options.satResult.solvedPkgs.len == 0:
-    displayError(options.satResult.output)
-    raise newNimbleError[NimbleError]("Couldnt find a solution for the packages. Unsatisfiable dependencies. Check there is no contradictory dependencies.")
+    raise resolutionFailureError(options.resolutionFailureMessage)
 
   var nims = options.satResult.pkgs.toSeq.filterIt(it.basicInfo.name.isNim)
   if nims.len == 0:
@@ -186,7 +228,7 @@ proc resolveNim*(rootPackage: PackageInfo, pkgListDecl: seq[PackageInfo], system
       return NimResolved(pkg: some(bestNim.get), version: bestNim.get.basicInfo.version)
 
     #TODO if we ever reach this point, we should just download the latest nim release
-    raise newNimbleError[NimbleError]("No Nim found")
+    raise resolutionFailureError("No Nim found")
   if nims.len > 1:
     #Before erroying make sure the version are actually different
     var versions = nims.mapIt(it.basicInfo.version)
@@ -213,7 +255,8 @@ proc setBootstrapNim*(systemNimPkg: Option[PackageInfo], pkgList: seq[PackageInf
     #if none of the above, we just set the version to be used. We dont want to install a nim until we
     #are clear that we need to actually use it. In order to pick the version, we get the releases.
     #Notice we should never call setNimBin for it. Rather we should attempt to use it directly.
-    let bestRelease = getOfficialReleases(options).max
+    options.checkMayInstallNim()
+    let bestRelease = (waitFor getOfficialReleases(options)).max
     bootstrapNim.version = bestRelease
 
     # echo "SETTING BOOTSTRAP NIM TO BEST RELEASE: ", bestRelease
@@ -254,7 +297,7 @@ proc getBootstrapNimResolved*(options: Options): NimResolved =
   setBootstrapNim(getNimFromSystem(options), pkgList, options)
   var bootstrapNim = options.satResult.bootstrapNim
   if bootstrapNim.nimResolved.pkg.isNone:
-    let nimInstalled = installNimFromBinariesDir(("nim", bootstrapNim.nimResolved.version.toVersionRange()), options)
+    let nimInstalled = waitFor installNimFromBinariesDir(("nim", bootstrapNim.nimResolved.version.toVersionRange()), options)
     if nimInstalled.isSome:
       bootstrapNim.nimResolved.pkg = some getPkgInfo(nimInstalled.get.dir, options, nimBin = none(string), level = pikRequires) #Can be empty as the code path for nim doesnt need it.
     else:
@@ -274,20 +317,33 @@ proc resolveAndConfigureNim*(rootPackage: PackageInfo, pkgList: seq[PackageInfo]
   let systemNimPkg = getNimFromSystem(options)
   if options.useSystemNim:
     if systemNimPkg.isNone:
-      raise newNimbleError[NimbleError]("No system nim found")
+      raise resolutionFailureError("No system nim found")
     # If there's a lock file, return early - solveLockFileDeps will handle resolution
     # If there's no lock file, we need to run the SAT solver with system nim
     if rootPackage.hasLockFile(options) and not options.disableLockFile:
       return NimResolved(pkg: some(systemNimPkg.get), version: systemNimPkg.get.basicInfo.version)
-    var pkgListDecl = pkgList.mapIt(it.toRequiresInfo(options, nimBin))
+    # The system nim is already resolved — thread its binary through discovery
+    # and solving instead of nimBin=none. With none, every freshly fetched
+    # dependency that needs the VM parser raises NeedsNimBinError inside the
+    # chronos discovery iterators (caught → "could not read package info"
+    # warnings) and the solve itself aborts with NeedsNimBinError only to be
+    # retried by withNimBinFallback. All that raise/catch churn inside closure
+    # iterators corrupts the exception stack on Nim <= 2.2 (SIGSEGV in
+    # popCurrentException; fixed in Nim 2.4) — and is pointless when nim is
+    # already known (#1669 regression).
+    let sysNimBin = some(
+      if systemNimPkg.get.nimBinPath.isSome:
+        systemNimPkg.get.nimBinPath.get  # System nim with non-standard layout (#1609)
+      else:
+        systemNimPkg.get.getNimPath())  # Standard layout
+    var pkgListDecl = pkgList.mapIt(it.toRequiresInfo(options, sysNimBin))
     pkgListDecl.add(systemNimPkg.get)
     pkgListDecl.sort(compPkgListByVersion)
     options.satResult.pkgList = pkgListDecl.toHashSet()
     options.satResult.pkgs = solvePackagesWithSystemNimFallback(
-        rootPackage, pkgListDecl, options, some(NimResolved(pkg: systemNimPkg, version: systemNimPkg.get.basicInfo.version)), nimBin)
+        rootPackage, pkgListDecl, options, some(NimResolved(pkg: systemNimPkg, version: systemNimPkg.get.basicInfo.version)), sysNimBin)
     if options.satResult.solvedPkgs.len == 0:
-      displayError(options.satResult.output)
-      raise newNimbleError[NimbleError]("Couldnt find a solution for the packages. Unsatisfiable dependencies.")
+      raise resolutionFailureError(options.resolutionFailureMessage)
     return NimResolved(pkg: some(systemNimPkg.get), version: systemNimPkg.get.basicInfo.version)
 
   # Special case: when installing nim itself globally, we want to install that specific version
@@ -296,12 +352,15 @@ proc resolveAndConfigureNim*(rootPackage: PackageInfo, pkgList: seq[PackageInfo]
     # Use the requested version from the command line (e.g. #head, #devel, >= 2.0.0)
     # not the declared version from nim.nimble (e.g. 2.3.1) which may not have binaries
     var requestedVer = parseVersionRange(rootPackage.basicInfo.version)
-    for pkg in options.action.packages:
-      if pkg.name.isNim:
-        requestedVer = pkg.ver
-        break
+    if options.action.typ in {actionInstall, actionPath, actionUninstall, actionDevelop,
+                               actionUpgrade, actionLock, actionAdd}:
+      for pkg in options.action.packages:
+        if pkg.name.isNim:
+          requestedVer = pkg.ver
+          break
+    options.checkMayInstallNim()
     let nimPkg = (name: "nim", ver: requestedVer)
-    let nimInstalled = installNimFromBinariesDir(nimPkg, options)
+    let nimInstalled = waitFor installNimFromBinariesDir(nimPkg, options)
     if nimInstalled.isSome:
       let resolvedNim = NimResolved(
         pkg: some getPkgInfo(nimInstalled.get.dir, options, nimBin = none(string), level = pikRequires), #Can be empty as the code path for nim doesnt need it.
@@ -334,11 +393,12 @@ proc resolveAndConfigureNim*(rootPackage: PackageInfo, pkgList: seq[PackageInfo]
   var resolvedNim = resolveNim(rootPackage, pkgListDecl, systemNimPkg, options)
   if resolvedNim.pkg.isNone:
     #we need to install it
+    options.checkMayInstallNim()
     let nimPkg = (name: "nim", ver: parseVersionRange(resolvedNim.version))
     #TODO handle the case where the user doesnt want to reuse nim binaries
     #It can be done inside the installNimFromBinariesDir function to simplify things out by
     #forcing a recompilation of nim.
-    let nimInstalled = installNimFromBinariesDir(nimPkg, options)
+    let nimInstalled = waitFor installNimFromBinariesDir(nimPkg, options)
     if nimInstalled.isSome:
       resolvedNim.pkg = some getPkgInfo(nimInstalled.get.dir, options, nimBin = none(string), level = pikRequires) #Can be empty as the code path for nim doesnt need it.
       resolvedNim.version = nimInstalled.get.ver

@@ -1,12 +1,14 @@
-# Copyright (C) Dominik Picheta. All rights reserved.
+# Copyright (C) the Nimble contributors. All rights reserved.
 # BSD License. Look at license.txt for more info.
 
 {.used.}
 
-import unittest, os, strutils, strformat, json, sets
+import unittest, os, osproc, strutils, strformat, json, sets
 import testscommon, nimblepkg/displaymessages, nimblepkg/paths
 
-from nimblepkg/common import cd, getLinkFileName, getLinkFileDir
+from nimblepkg/common import cd
+from nimblepkg/packageinfo import lockFileHasNim
+from nimblepkg/options import initOptions, defaultLockFileName
 from nimblepkg/developfile import developFileName, pkgFoundMoreThanOnceMsg
 from nimblepkg/version import newVersion, parseVersionRange
 from nimblepkg/nimbledatafile import nimbleDataFileName, NimbleDataJsonKeys
@@ -30,6 +32,10 @@ suite "develop feature":
     defaultPath = "vendor"
   
   let anyVersion = parseVersionRange("")
+  # Absolute path to the develop package list fixture. Tests below `cd` into
+  # installDir (outside the repo), so the old cwd-relative `../develop/...`
+  # spelling no longer resolves to tests/develop/. Anchor it absolutely.
+  let developPkgList = testsDir / "develop" / pkgListFileName
 
   test "can develop from dir with srcDir":
     cd &"develop/{pkgSrcDirTestName}":
@@ -44,33 +50,195 @@ suite "develop feature":
     cdCleanDir installDir:
       let (output, exitCode) = execNimble("develop", pkgAUrl)
       check exitCode == QuitSuccess
+      # No host project + single package: PackageA is cloned as the root (./PackageA).
+      check dirExists(installDir / pkgAName.toLowerAscii)
       check output.processOutput.inLines(
-        pkgSetupInDevModeMsg(pkgAName, installDir / defaultPath / pkgAName))
+        pkgSetupInDevModeMsg(pkgAName, installDir / pkgAName.toLowerAscii))
 
   test "can develop from package name":
     cdCleanDir installDir:
-      usePackageListFile &"../develop/{pkgListFileName}":
+      usePackageListFile developPkgList:
         let (output, exitCode) = execNimble("develop", pkgBName)
         check exitCode == QuitSuccess
-        var lines = output.processOutput
-        check lines.inLines(
-          pkgSetupInDevModeMsg(pkgBName, installDir / defaultPath / pkgBName))
+        # Single pkg, no host: PackageB is the root; bare (no --with-dependencies)
+        # so its dep PackageA is installed normally, NOT vendored under PackageB/.
+        check dirExists(installDir / pkgBName.toLowerAscii)
+        check not dirExists(
+          installDir / pkgBName.toLowerAscii / defaultPath / pkgAName.toLowerAscii)
+        check output.processOutput.inLines(
+          pkgSetupInDevModeMsg(pkgBName, installDir / pkgBName.toLowerAscii))
 
-  test "can develop with dependencies":
+  test "develop multiple pkgs outside a project records a free develop file":
     cdCleanDir installDir:
-      usePackageListFile &"../develop/{pkgListFileName}":
-        let (output, exitCode) = execNimble(
+      usePackageListFile developPkgList:
+        # Multiple packages with no host project fall back to a parent free
+        # develop file — there's no single root to attach them to.
+        let (_, exitCode) = execNimble("develop", pkgAName, pkgBName)
+        check exitCode == QuitSuccess
+        check fileExists(developFileName)
+        let dev = readFile(developFileName).toLowerAscii
+        check pkgAName.toLowerAscii in dev
+        check pkgBName.toLowerAscii in dev
+
+  test "explicit --developFile wins over the default free develop file":
+    cdCleanDir installDir:
+      usePackageListFile developPkgList:
+        let (_, exitCode) = execNimble(
+          "develop", pkgBName, "--developFile:custom.develop")
+        check exitCode == QuitSuccess
+        check fileExists("custom.develop")
+        check not fileExists(developFileName)
+
+  test "develop <pkg> --with-dependencies (no host) makes the pkg the root":
+    # `nimble develop PackageB --with-dependencies` in a dir with no host project
+    # is equivalent to `git clone PackageB && cd PackageB && nimble develop
+    # --with-dependencies`: PackageB is cloned as the root (./PackageB, not under
+    # vendor/) and its dependency PackageA is vendored under PackageB/vendor/.
+    cdCleanDir installDir:
+      usePackageListFile developPkgList:
+        let (_, exitCode) = execNimble(
           "develop", "--with-dependencies", pkgBName)
         check exitCode == QuitSuccess
-        var lines = output.processOutput
-        check lines.inLines(
-          pkgSetupInDevModeMsg(pkgAName, installDir / defaultPath / pkgAName))
-        check lines.inLines(
-          pkgSetupInDevModeMsg(pkgBName, installDir / defaultPath / pkgBName))
+        let pkgBRoot = installDir / pkgBName.toLowerAscii
+        # PackageB is the root (./PackageB), NOT vendored under ./vendor/
+        check dirExists(pkgBRoot)
+        check not dirExists(installDir / defaultPath / pkgBName.toLowerAscii)
+        # its dependency PackageA is vendored under PackageB/vendor/
+        check dirExists(pkgBRoot / defaultPath / pkgAName.toLowerAscii)
+        # paths file is generated inside the root package
+        check fileExists(pkgBRoot / "nimble.paths")
+
+  test "develop --with-dependencies does not vendor nim without a nim lock entry":
+    # nim (the compiler) is vendored only when the project's nimble.lock pins it.
+    # PackageB has no lock file, so nim must not be cloned into vendor/.
+    cdCleanDir installDir:
+      usePackageListFile developPkgList:
+        let (_, exitCode) = execNimble(
+          "develop", "--with-dependencies", pkgBName)
+        check exitCode == QuitSuccess
+        let vendorDir = installDir / pkgBName.toLowerAscii / defaultPath
+        check dirExists(vendorDir)          # its library dep IS vendored
+        check not dirExists(vendorDir / "nim")
+
+  test "develop --with-dependencies --useSystemNim does not vendor nim":
+    # --useSystemNim must never vendor nim, even if a lock pinned it: the system
+    # nim may be a binary-only install with no sources to develop against.
+    cdCleanDir installDir:
+      usePackageListFile developPkgList:
+        let (_, exitCode) = execNimble(
+          "--useSystemNim", "develop", "--with-dependencies", pkgBName)
+        check exitCode == QuitSuccess
+        let vendorDir = installDir / pkgBName.toLowerAscii / defaultPath
+        check not dirExists(vendorDir / "nim")
+
+  test "lockFileHasNim gates nim vendoring":
+    # Unit-level check of the predicate that decides nim vendoring, without the
+    # cost of actually cloning Nim: a lock that pins nim -> true; a lock without
+    # nim, or a missing lock -> false.
+    let opts = initOptions()
+    let tmp = getTempDir() / "tdevelop_lockhasnim"
+    createDir tmp
+    defer: removeDir tmp
+
+    let lockWithNim = tmp / "with_nim.lock"
+    writeFile(lockWithNim, """{
+  "version": 1,
+  "packages": {
+    "nim": {
+      "version": "2.0.8",
+      "vcsRevision": "28021a6356119aad32a00815e1dc63b934c5cb40",
+      "url": "https://github.com/nim-lang/Nim.git",
+      "downloadMethod": "git",
+      "dependencies": [],
+      "checksums": { "sha1": "83c1d893cb997417565b7208e3cbebb8f93222cb" }
+    }
+  },
+  "tasks": {}
+}""")
+    check lockFileHasNim(lockWithNim, opts)
+
+    let lockNoNim = tmp / "no_nim.lock"
+    writeFile(lockNoNim, """{
+  "version": 1,
+  "packages": {
+    "results": {
+      "version": "0.5.1",
+      "vcsRevision": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "url": "https://github.com/arnetheduck/nim-results",
+      "downloadMethod": "git",
+      "dependencies": [],
+      "checksums": { "sha1": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" }
+    }
+  },
+  "tasks": {}
+}""")
+    check not lockFileHasNim(lockNoNim, opts)
+    check not lockFileHasNim(tmp / "missing.lock", opts)
+
+  test "develop inside a vendored package clones deps flat (no nesting)":
+    cdCleanDir installDir:
+      usePackageListFile developPkgList:
+        # Host project so `develop packageb` records packageb in the project's
+        # nimble.develop (does not rely on the no-host free-develop-file feature).
+        writeFile("host.nimble", """
+version = "0.1.0"
+author = "Test"
+description = "host"
+license = "MIT"
+requires "nim"
+""")
+        let (_, e1) = execNimble("develop", pkgBName)
+        check e1 == QuitSuccess
+        check fileExists(developFileName)
+        var pkgBDir = ""
+        for kind, d in walkDir(installDir / defaultPath):
+          if kind == pcDir and d.splitPath.tail.toLowerAscii.contains("packageb"):
+            pkgBDir = d
+        check pkgBDir.len > 0
+        cd pkgBDir:
+          let (_, e2) = execNimble("develop", "--with-dependencies")
+          check e2 == QuitSuccess
+        var packageaFlat = false
+        var anyNested = false
+        for kind, d in walkDir(installDir / defaultPath):
+          if kind != pcDir: continue
+          if d.splitPath.tail.toLowerAscii.contains("packagea"):
+            packageaFlat = true
+          if dirExists(d / defaultPath):
+            anyNested = true
+        check packageaFlat
+        check not anyNested
+
+  test "develop inside a vendored package respects an explicit --path":
+    cdCleanDir installDir:
+      usePackageListFile developPkgList:
+        writeFile("host.nimble", """
+version = "0.1.0"
+author = "Test"
+description = "host"
+license = "MIT"
+requires "nim"
+""")
+        let (_, e1) = execNimble("develop", pkgBName)
+        check e1 == QuitSuccess
+        var pkgBDir = ""
+        for kind, d in walkDir(installDir / defaultPath):
+          if kind == pcDir and d.splitPath.tail.toLowerAscii.contains("packageb"):
+            pkgBDir = d
+        check pkgBDir.len > 0
+        cd pkgBDir:
+          let (_, e2) = execNimble("develop", "--with-dependencies", "--path:mydeps")
+          check e2 == QuitSuccess
+          check dirExists("mydeps")
+        var packageaFlat = false
+        for kind, d in walkDir(installDir / defaultPath):
+          if kind == pcDir and d.splitPath.tail.toLowerAscii.contains("packagea"):
+            packageaFlat = true
+        check not packageaFlat
 
   test "develop with dependencies generates nimble.paths with vendor paths":
     cdCleanDir installDir:
-      usePackageListFile &"../develop/{pkgListFileName}":
+      usePackageListFile developPkgList:
         # Create a project that requires packagea (available in the test package list)
         writeFile("testproject.nimble", &"""
 version = "0.1.0"
@@ -102,7 +270,7 @@ requires "nim >= 1.6.0", "packagea"
             getPackageDir(pkgsDir, "PackageA-").len > 0
     # Step 2: Create a project that requires packagea and run develop --withDeps
     cdCleanDir installDir / "testproject":
-      usePackageListFile &"../../develop/{pkgListFileName}":
+      usePackageListFile developPkgList:
         writeFile("testproject.nimble", """
 version = "0.1.0"
 author = "Test"
@@ -125,7 +293,7 @@ requires "nim >= 1.6.0", "packagea"
 
   test "develop prefers vendor over cached versions (hasVersion shadowing bug)":
     cdCleanDir installDir:
-      usePackageListFile &"../develop/{pkgListFileName}":
+      usePackageListFile developPkgList:
         # Seed tagged_versions.json cache with packagea
         let pkgCacheDir = installDir / "pkgcache"
         createDir(pkgCacheDir)
@@ -156,9 +324,342 @@ requires "nim >= 1.6.0", "packagea"
         check pathsContent.contains(defaultPath)
         check not pathsContent.contains("pkgs2")
 
+  test "bare 'nimble develop' installs deps without vendoring (#1510)":
+    # Only `--with-dependencies` creates a vendor/. Bare `nimble develop` in a
+    # project installs its dependencies through the regular (non-develop) route
+    # and generates nimble.paths pointing at pkgs2 — no vendor/ is created.
+    # `-l` forces local mode (test infra otherwise injects --global).
+    cdCleanDir installDir:
+      usePackageListFile developPkgList:
+        writeFile("testproject.nimble", &"""
+version = "0.1.0"
+author = "Test"
+description = "Test"
+license = "MIT"
+requires "nim >= 1.6.0", "packagea"
+""")
+        let (_, exitCode) = execNimble("develop", "-l")
+        check exitCode == QuitSuccess
+        # bare ⇒ no vendor/ is created
+        check not dirExists(getCurrentDir() / defaultPath / "packagea")
+        check fileExists("nimble.paths")
+        let pathsContent = readFile("nimble.paths")
+        check pathsContent.toLowerAscii.contains("packagea")
+        # deps come from the regular install location, not a vendor
+        check pathsContent.contains("pkgs2")
+
+  test "nimble path respects develop file (#1344)":
+    # `nimble path <pkg>` only consulted installed packages in pkgs2/,
+    # ignoring the develop file. After `develop --with-dependencies`, asking
+    # for the path of a vendored dep should return the vendor path, not a
+    # cached pkgs2/ copy (and must succeed even if pkgs2/ has no entry).
+    cdCleanDir installDir:
+      usePackageListFile developPkgList:
+        writeFile("testproject.nimble", &"""
+version = "0.1.0"
+author = "Test"
+description = "Test"
+license = "MIT"
+requires "nim >= 1.6.0", "packagea"
+""")
+        let (_, devExit) = execNimble("develop", "-l", "--with-dependencies")
+        check devExit == QuitSuccess
+        let vendorPkgA = getCurrentDir() / defaultPath / "packagea"
+        check dirExists(vendorPkgA)
+
+        let (pathOut, pathExit) = execNimble("path", "-l", "packagea")
+        check pathExit == QuitSuccess
+        check pathOut.contains(defaultPath)
+        check not pathOut.contains("pkgs2")
+
+  test "develop --withDeps vendors under canonical name not git repo name (#1508)":
+    let repoDir = getTempDir() / "nim-funkylib-repo"
+    let pkgListFile = getTempDir() / "t1508_packages.json"
+    cleanDir repoDir
+    createDir repoDir
+    writeFile(repoDir / "funkylib.nimble", """
+version = "0.1.0"
+author = "Test"
+description = "Test"
+license = "MIT"
+""")
+    cd repoDir:
+      check execCmdEx("git init -q").exitCode == 0
+      check execCmdEx("git config user.name t").exitCode == 0
+      check execCmdEx("git config user.email t@t").exitCode == 0
+      check execCmdEx("git add .").exitCode == 0
+      check execCmdEx("git commit -q -m initial").exitCode == 0
+      check execCmdEx("git tag v0.1.0").exitCode == 0
+    let pkgList = %* [{
+      "name": "funkylib",
+      "url": "file://" & repoDir,
+      "method": "git",
+      "tags": ["test"],
+      "description": "Test",
+      "license": "MIT"
+    }]
+    writeFile(pkgListFile, $pkgList)
+    defer:
+      removeDir repoDir
+      removeFile pkgListFile
+    cdCleanDir installDir:
+      usePackageListFile pkgListFile:
+        writeFile("testproject.nimble", """
+version = "0.1.0"
+author = "Test"
+description = "Test"
+license = "MIT"
+requires "nim >= 1.6.0", "funkylib"
+""")
+        let (_, exitCode) = execNimble("develop", "-l", "--with-dependencies")
+        check exitCode == QuitSuccess
+        # Vendor dir must use canonical name "funkylib", not URL tail "nim-funkylib-repo".
+        check dirExists(getCurrentDir() / defaultPath / "funkylib")
+        check not dirExists(getCurrentDir() / defaultPath / "nim-funkylib-repo")
+
+  test "nimble setup after develop --withDeps reuses vendor packages (#1566)":
+    # After `nimble develop --with-dependencies` clones deps into vendor/ and
+    # writes nimble.develop, a follow-up `nimble setup` should NOT re-download
+    # the same packages from git. Vendor copies must be reused.
+    let topRepo = getTempDir() / "t1566-t1566lib-repo"
+    let depRepo = getTempDir() / "t1566-t1566dep-repo"
+    let pkgListFile = getTempDir() / "t1566_packages.json"
+    removeDir topRepo
+    removeDir depRepo
+    createDir topRepo
+    createDir depRepo
+    writeFile(depRepo / "t1566dep.nimble", """
+version = "0.1.0"
+author = "Test"
+description = "Test"
+license = "MIT"
+""")
+    writeFile(topRepo / "t1566lib.nimble", """
+version = "0.1.0"
+author = "Test"
+description = "Test"
+license = "MIT"
+requires "nim >= 1.6.0", "t1566dep"
+""")
+    proc initRepo(d: string) =
+      cd d:
+        check execCmdEx("git init -q").exitCode == 0
+        check execCmdEx("git config user.name t").exitCode == 0
+        check execCmdEx("git config user.email t@t").exitCode == 0
+        check execCmdEx("git add .").exitCode == 0
+        check execCmdEx("git commit -q -m initial").exitCode == 0
+        check execCmdEx("git tag v0.1.0").exitCode == 0
+    initRepo(depRepo)
+    initRepo(topRepo)
+    # Build a Windows-safe file URL. On Windows the path has a drive
+    # letter; the double-slash form (file://C:/...) breaks because
+    # parseUri treats `C` as the host and re-serializes without the
+    # colon — git then sees `file://C/...` and fails. The triple-slash
+    # form (file:///C:/...) parses with empty host + full path and
+    # round-trips intact. On unix the double-slash form is correct.
+    proc toFileUrl(p: string): string =
+      when defined(windows): "file:///" & p.replace('\\', '/')
+      else: "file://" & p
+    let topUrl = toFileUrl(topRepo)
+    let depUrl = toFileUrl(depRepo)
+    let pkgList = %* [
+      {"name": "t1566lib", "url": topUrl, "method": "git",
+       "tags": ["test"], "description": "Test", "license": "MIT"},
+      {"name": "t1566dep", "url": depUrl, "method": "git",
+       "tags": ["test"], "description": "Test", "license": "MIT"}
+    ]
+    writeFile(pkgListFile, $pkgList)
+    defer:
+      removeDir topRepo
+      removeDir depRepo
+      removeFile pkgListFile
+    cdCleanDir installDir:
+      usePackageListFile pkgListFile:
+        # Pre-install t1566dep into pkgs2/ to mimic "this dep was already
+        # cached from prior work" — closer to arnetheduck's nora-poc state,
+        # where some deps are already installed before `develop --withDeps`
+        # runs. If develop short-circuits transitive discovery for already-
+        # installed deps, t1566dep would still end up missing from vendor/.
+        let (_, instExit) = execNimbleYes("install", "t1566dep")
+        check instExit == QuitSuccess
+        writeFile("testproject.nimble", """
+version = "0.1.0"
+author = "Test"
+description = "Test"
+license = "MIT"
+requires "nim >= 1.6.0", "t1566lib"
+""")
+        let (_, devExit) = execNimble("develop", "-l", "--with-dependencies")
+        check devExit == QuitSuccess
+        check dirExists(getCurrentDir() / defaultPath / "t1566lib")
+        check dirExists(getCurrentDir() / defaultPath / "t1566dep")
+        # Now run setup: it must NOT re-download t1566lib or t1566dep.
+        let (setupOut, setupExit) = execNimble("setup", "-l")
+        check setupExit == QuitSuccess
+        check not setupOut.contains("Downloading file://")
+        check dirExists(getCurrentDir() / defaultPath / "t1566lib")
+        check dirExists(getCurrentDir() / defaultPath / "t1566dep")
+
+  test "a develop clone's revision is git's, not a snapshot from clone time":
+    # `downloadPkg` writes a `nimblemeta.json` into everything it downloads and
+    # `fillMetaData` lets that file win over git. In a cache directory it is the
+    # only record there is and nothing ever changes it. In a develop checkout it
+    # froze the revision at the moment nimble cloned, so the lock file went on
+    # pinning work the user had long since moved past.
+    let depRepo = getTempDir() / "tdevmeta-repo"
+    let pkgListFile = getTempDir() / "tdevmeta_packages.json"
+    removeDir depRepo
+    createDir depRepo
+    writeFile(depRepo / "tdevmeta.nimble", """
+version = "0.1.0"
+author = "Test"
+description = "Test"
+license = "MIT"
+""")
+    cd depRepo:
+      check execCmdEx("git init -q").exitCode == 0
+      check execCmdEx("git config user.name t").exitCode == 0
+      check execCmdEx("git config user.email t@t").exitCode == 0
+      # The develop checkout pushes back here, and this repo is not bare.
+      check execCmdEx("git config receive.denyCurrentBranch ignore").exitCode == 0
+      check execCmdEx("git add .").exitCode == 0
+      check execCmdEx("git commit -q -m initial").exitCode == 0
+      check execCmdEx("git tag v0.1.0").exitCode == 0
+    proc toFileUrl(p: string): string =
+      when defined(windows): "file:///" & p.replace('\\', '/')
+      else: "file://" & p
+    writeFile(pkgListFile, $(%* [
+      {"name": "tdevmeta", "url": toFileUrl(depRepo), "method": "git",
+       "tags": ["test"], "description": "Test", "license": "MIT"}]))
+    defer:
+      removeDir depRepo
+      removeFile pkgListFile
+    cdCleanDir installDir:
+      usePackageListFile pkgListFile:
+        writeFile("testproject.nimble", """
+version = "0.1.0"
+author = "Test"
+description = "Test"
+license = "MIT"
+requires "tdevmeta"
+""")
+        # `lock` writes a sync file, which needs the project under version
+        # control. Only the nimble file is committed; the nimble dir around it
+        # is scratch.
+        check execCmdEx("git init -q").exitCode == 0
+        check execCmdEx("git config user.name t").exitCode == 0
+        check execCmdEx("git config user.email t@t").exitCode == 0
+        check execCmdEx("git add testproject.nimble").exitCode == 0
+        check execCmdEx("git commit -q -m project").exitCode == 0
+
+        check execNimble("develop", "-l", "tdevmeta").exitCode == QuitSuccess
+        let clone = getCurrentDir() / defaultPath / "tdevmeta"
+        check dirExists(clone)
+        # It is the user's own source tree: nimble leaves no bookkeeping in it.
+        check not fileExists(clone / "nimblemeta.json")
+
+        var head = ""
+        cd clone:
+          # The clone inherits no identity: CI runners have no global git user.
+          check execCmdEx("git config user.name t").exitCode == 0
+          check execCmdEx("git config user.email t@t").exitCode == 0
+          writeFile("tdevmeta.nimble",
+                    readFile("tdevmeta.nimble") & "# local work\n")
+          check execCmdEx("git commit -q -am work").exitCode == 0
+          check execCmdEx("git push -q origin HEAD").exitCode == 0
+          head = execCmdEx("git rev-parse HEAD").output.strip
+
+        let (output, exitCode) = execNimbleYes("lock", "-l")
+        checkpoint(output)
+        check exitCode == QuitSuccess
+        check readFile(defaultLockFileName).contains(head)
+
+  test "develop overrides == pinned dependency (#1000)":
+    let depDir = getTempDir() / "nimble_t1000_depa"
+    cleanDir depDir
+    createDir depDir
+    writeFile(depDir / "depa.nimble", """
+version = "0.5.0"
+author = "Test"
+description = "Test"
+license = "MIT"
+""")
+    cdCleanDir installDir:
+      writeFile("testproject.nimble", """
+version = "0.1.0"
+author = "Test"
+description = "Test"
+license = "MIT"
+requires "nim >= 1.6.0", "depa == 0.1.0"
+""")
+      let (addOut, addExit) = execNimble("develop", "-l", "--add:" & depDir)
+      check addExit == QuitSuccess
+      check not addOut.contains("are not in the required")
+      check fileExists("nimble.develop")
+      # A follow-up command that re-validates develop deps must also pass.
+      let (checkOut, checkExit) = execNimble("check", "-l")
+      check checkExit == QuitSuccess
+      check not checkOut.contains("are not in the required")
+
+  test "develop --withDeps handles URL deps with branch refs (#1567)":
+    # Regression for nim-lang/nimble#1567 / develop_issues.md #2:
+    # When the root requires a URL dep with a branch ref (`.git#branch`), the
+    # SAT solver resolves it to a special version (e.g. `#head`). Previously,
+    # developFromSolution built a PkgTuple via `parseVersionRange("== " & $ver)`
+    # which produced the invalid string `== #head` and crashed with
+    # "Unexpected char in version range '== #head': #".
+    cdCleanDir installDir:
+      usePackageListFile developPkgList:
+        writeFile("testproject.nimble", &"""
+version = "0.1.0"
+author = "Test"
+description = "Test"
+license = "MIT"
+requires "nim >= 1.6.0", "https://github.com/jmgomez/packagea.git#head"
+""")
+        let (output, exitCode) = execNimble("develop", "-l", "--with-dependencies")
+        check exitCode == QuitSuccess
+        check not output.contains("Unexpected char in version range")
+        check dirExists(getCurrentDir() / defaultPath / "packagea")
+        check fileExists("nimble.develop")
+
+  test "develop works in a directory not under version control (#1509)":
+    # Regression for nim-lang/nimble#1509 / develop_issues.md #5:
+    # Running `nimble develop --add:<pkg>` in a non-VCS directory failed with
+    # "Sync file require current working directory to be under some supported
+    # type of version control." The sync file is only meaningful when there's
+    # a VCS to record revisions against — a vendor folder in a plain directory
+    # should work without it.
+    # Uses /tmp so that `getVcsTypeAndSpecialDirPath`'s parent walk doesn't
+    # find the nimble repo's own .git as an ancestor.
+    let noVcsDir = getTempDir() / "nimble_t1509"
+    cleanDir noVcsDir
+    createDir noVcsDir
+    let depDir = getTempDir() / "nimble_t1509_dep"
+    cleanDir depDir
+    createDir depDir
+    writeFile(depDir / "depa.nimble", """
+version = "0.1.0"
+author = "Test"
+description = "Test"
+license = "MIT"
+""")
+    cd noVcsDir:
+      writeFile("testproject.nimble", """
+version = "0.1.0"
+author = "Test"
+description = "Test"
+license = "MIT"
+requires "nim >= 1.6.0"
+""")
+      let (output, exitCode) = execNimble("develop", "-l", "--add:" & depDir)
+      check exitCode == QuitSuccess
+      check not output.contains("supported type of version control")
+      check fileExists("nimble.develop")
+
   test "can develop list of packages":
     cdCleanDir installDir:
-      usePackageListFile &"../develop/{pkgListFileName}":
+      usePackageListFile developPkgList:
         let (output, exitCode) = execNimble(
           "develop", pkgAName, pkgBName)
         check exitCode == QuitSuccess
@@ -167,33 +668,6 @@ requires "nim >= 1.6.0", "packagea"
           pkgAName, installDir / defaultPath / pkgAName))
         check lines.inLines(pkgSetupInDevModeMsg(
           pkgBName, installDir / defaultPath / pkgBName))
-
-  test "can develop global":
-    cleanDir installDir
-    usePackageListFile &"develop/{pkgListFileName}":
-      let dependencyPath = getCurrentDir() / "develop" / "dependency"
-
-      # Check that a link file can be created for a global develop dependency.
-      cd dependencyPath:
-        let (output, exitCode) = execNimble("develop", "--global")
-        check exitCode == QuitSuccess
-        var lines = output.processOutput
-        let linkFilePath = installDir / "links" / depName.getLinkFileDir /
-                           depName.getLinkFileName
-        check lines.inLinesOrdered(pkgLinkFileSavedMsg(linkFilePath))
-        check lines.inLinesOrdered(pkgSetupInDevModeMsg(
-          depName, dependencyPath ))
-        check linkFilePath.fileExists
-        let linkFileLines = linkFilePath.readFile.split('\n')
-        let expectedLinkNimbleFilePath = dependencyPath / depName & ".nimble"
-        check linkFileLines[0] == expectedLinkNimbleFilePath
-        check linkFileLines[1] == dependencyPath
-
-      # Check that a link file can be used for finding the dependency.
-      cd "develop/dependent":
-        cleanFile dependentPkgName.addFileExt(ExeExt)
-        let (_, exitCode) = execNimble("run")
-        check exitCode == QuitSuccess
 
   # Skipped: In vnext, develop does not install dependencies to pkgs2,
   # so the "remove" command can't find them. This reverse-dependency check
@@ -207,12 +681,63 @@ requires "nim >= 1.6.0", "packagea"
       check output.processOutput.inLines(
         pkgSetupInDevModeMsg("binary", getCurrentDir()))
 
+  test "develop lib + bin simultaneously picks up live lib changes (#1165)":
+    # Regression for nim-lang/nimble#1165: a binary linked via
+    # `develop -a:` to a local library must observe edits to that library
+    # without re-installing it. Builds the bin once with the lib at "v1",
+    # edits the lib source to "v2", rebuilds, and asserts the bin's runtime
+    # output reflects the edit — proving the develop link is live.
+    cdCleanDir installDir:
+      # Lib package: exports a single proc returning a literal.
+      createDir(installDir / "mylib" / "src")
+      writeFile(installDir / "mylib" / "mylib.nimble", """
+version = "0.1.0"
+author = "Test"
+description = "lib"
+license = "MIT"
+srcDir = "src"
+requires "nim >= 1.6.0"
+""")
+      writeFile(installDir / "mylib" / "src" / "mylib.nim",
+                "proc greet*(): string = \"v1\"\n")
+      # Bin package: imports the lib and echoes its return value.
+      createDir(installDir / "myapp" / "src")
+      writeFile(installDir / "myapp" / "myapp.nimble", """
+version = "0.1.0"
+author = "Test"
+description = "bin"
+license = "MIT"
+srcDir = "src"
+bin = @["myapp"]
+requires "nim >= 1.6.0", "mylib"
+""")
+      writeFile(installDir / "myapp" / "src" / "myapp.nim",
+                "import mylib\necho greet()\n")
+
+      cd installDir / "myapp":
+        let (_, devExit) = execNimble("develop", "-l", "-a:" & (installDir / "mylib"))
+        check devExit == QuitSuccess
+        # First run: bin should print "v1".
+        let (out1, run1Exit) = execNimble("run", "-l")
+        check run1Exit == QuitSuccess
+        check out1.contains("v1")
+        # Edit the lib source — develop link must point at this exact file.
+        writeFile(installDir / "mylib" / "src" / "mylib.nim",
+                  "proc greet*(): string = \"v2\"\n")
+        # Second run: bin must reflect the lib edit, not the previous build.
+        let (out2, run2Exit) = execNimble("run", "-l")
+        check run2Exit == QuitSuccess
+        check out2.contains("v2")
+
   test "can develop hybrid":
     cd &"develop/{pkgHybridName}":
       let (output, exitCode) = execNimble("develop")
       check exitCode == QuitSuccess
       var lines = output.processOutput
-      check lines.inLinesOrdered("will not be compiled")
+      # #853: the misleading "binaries will not be compiled" warning was
+      # removed for binary and hybrid packages. `nimble build` still builds
+      # the binary; develop only sets up dependencies.
+      check not lines.inLines("will not be compiled")
       check lines.inLinesOrdered(
         pkgSetupInDevModeMsg(pkgHybridName, getCurrentDir()))
 
@@ -326,6 +851,25 @@ requires "nim >= 1.6.0", "packagea"
         (output, exitCode) = execNimble("run")
         check exitCode == QuitSuccess
         check packageDirExists(pkgsDir, pkgAName & "-0.5.0")
+
+  test "build reports which deps are develop-linked (#405)":
+    # Regression for nim-lang/nimble#405: it's hard to tell whether a
+    # `develop -a:` link is actually being consumed by a build. The output
+    # must name the develop-linked dependency together with its source
+    # directory so users can confirm the link is active without inspecting
+    # nimble.paths by hand.
+    cleanDir installDir
+    cd dependentPkgPath:
+      usePackageListFile &"../{pkgListFileName}":
+        cleanFiles developFileName, dependentPkgName.addFileExt(ExeExt)
+        let (_, devExit) = execNimble("develop", &"-a:{depPath}")
+        check devExit == QuitSuccess
+        let (output, runExit) = execNimble("run")
+        check runExit == QuitSuccess
+        let lines = output.processOutput
+        # Develop status surfaced for the linked dep at default verbosity.
+        let depAbs = depPath.absolutePath.normalizedPath
+        check lines.inLines(&"{depName} [develop: {depAbs}]")
 
   test "warning on attempt to add the same package twice":
     cd dependentPkgPath:
@@ -955,7 +1499,7 @@ requires "nim >= 1.6.0", "packagea"
   test "add develop --with-dependencies packages to free develop file":
     cdCleanDir installDir:
       const developFile = "develop.json"
-      usePackageListFile &"../develop/{pkgListFileName}":
+      usePackageListFile developPkgList:
         let (output, exitCode) = execNimble("--debug", "develop",
           "--with-dependencies", &"--develop-file:{developFile}", pkgBName)
         check exitCode == QuitSuccess

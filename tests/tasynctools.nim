@@ -1,5 +1,5 @@
-import unittest, chronos, strutils, os, tables
-import std/options
+import unittest, chronos, strutils, os, tables, strformat
+import std/[options, tempfiles, osproc]
 import nimblepkg/[tools, download, options, packageinfotypes, sha1hashes, version, versiondiscovery]
 
 {.used.}
@@ -9,6 +9,22 @@ suite "Async Tools":
     let (output, exitCode) = waitFor doCmdExAsync("echo hello")
     check exitCode == 0
     check "hello" == output.strip
+
+  test "doCmdExAsync preserves quoted executable and arguments with spaces":
+    let tmpDir = createTempDir("nimble async command ", "")
+    defer: removeDir(tmpDir)
+    let source = tmpDir / "echoargs.nim"
+    let executable = tmpDir / "argument echo".addFileExt(ExeExt)
+    writeFile(source, "import std/os\nfor i in 1 .. paramCount(): echo paramStr(i)\n")
+    let compiled = execCmdEx(findExe("nim").quoteShell &
+      " c --hints:off --skipUserCfg --skipParentCfg --noNimblePath -o:" &
+      executable.quoteShell & " " & source.quoteShell)
+    checkpoint(compiled.output)
+    require compiled.exitCode == QuitSuccess
+    let (output, exitCode) = waitFor doCmdExAsync(executable.quoteShell &
+      " " & "first argument".quoteShell & " " & "second argument".quoteShell)
+    check exitCode == QuitSuccess
+    check output.strip().splitLines() == @["first argument", "second argument"]
 
   test "doCloneAsync clones a repo":
     let tmpDir = getTempDir() / "nimble_async_test"
@@ -50,6 +66,34 @@ suite "Async Tools":
 
     removeDir(tmpDir)
 
+  test "gitFetchTags survives a tag the remote has moved":
+    # nimbus-eth2 force-moves its rolling `nightly` tag. Against such a repo
+    # a plain `git fetch --tags` exits 1 with "would clobber existing tag",
+    # which loses every *other* new tag too and makes the package look
+    # versionless. Both fetch procs must tolerate it.
+    let tmpDir = getTempDir() / "nimble_moved_tag_test"
+    let originDir = tmpDir / "origin"
+    let cloneDir = tmpDir / "clone"
+    if dirExists(tmpDir):
+      removeDir(tmpDir)
+    createDir(originDir)
+    let git = &"git -c user.name=t -c user.email=t@t -C {originDir.quoteShell}"
+    tryDoCmdEx(&"{git} init -q")
+    tryDoCmdEx(&"{git} commit -q --allow-empty -m one")
+    tryDoCmdEx(&"{git} tag nightly")
+    tryDoCmdEx(&"git clone -q {originDir.quoteShell} {cloneDir.quoteShell}")
+    # Upstream moves the rolling tag and publishes a real release.
+    tryDoCmdEx(&"{git} commit -q --allow-empty -m two")
+    tryDoCmdEx(&"{git} tag -f nightly")
+    tryDoCmdEx(&"{git} tag v1.1.0")
+
+    let options = initOptions()
+    gitFetchTags(cloneDir, DownloadMethod.git, options)
+    waitFor gitFetchTagsAsync(cloneDir, DownloadMethod.git, options)
+    check "v1.1.0" in getTagsList(cloneDir, DownloadMethod.git)
+
+    removeDir(tmpDir)
+
   test "getTagsListRemoteAsync queries remote tags":
     let repoUrl = "https://github.com/arnetheduck/nim-results"
 
@@ -80,12 +124,29 @@ suite "Async Tools":
 
     removeDir(tmpDir)
 
+  test "synchronous package tarballs extract in paths with spaces":
+    let tmpDir = createTempDir("nimble sync tarball ", "")
+    defer: removeDir(tmpDir)
+    var opts = initOptions()
+    opts.nimbleDir = tmpDir / "store"
+    opts.enableTarballs = true
+    opts.ignoreSubmodules = true
+    let revision = initSha1Hash("8a03fb2e00dccbf35807c869e0184933b0cffa37")
+    let downloaded = downloadPkg("https://github.com/arnetheduck/nim-results",
+      newVersion("0.4.0").toVersionRange, DownloadMethod.git, "", opts,
+      downloadPath = tmpDir / "download path", vcsRevision = revision,
+      nimBin = some(findExe("nim")))
+    check fileExists(downloaded.dir / "README.md")
+    check not dirExists(downloaded.dir / ".git")
+    check downloaded.vcsRevision == revision
+
   test "doDownloadTarballAsync downloads and extracts tarball":
     # Skip on systems without tar
     if findExe("tar") == "":
       skip()
 
-    let tmpDir = getTempDir() / "nimble_async_test_tarball"
+    # Exercise quoting of both the extraction directory and archive filename.
+    let tmpDir = getTempDir() / "nimble async test tarball"
     let downloadDir = tmpDir / "download"
 
     if dirExists(tmpDir):
@@ -187,7 +248,7 @@ suite "Async Tools":
 
     removeDir(tmpDir)
 
-  test "getPackageMinimalVersionsFromRepoAsync gets package versions":
+  test "getPackageMinimalVersionsFromRepo gets package versions":
     let tmpDir = getTempDir() / "nimble_async_test_minimalversions"
     let repoDir = tmpDir / "repo"
 
@@ -208,8 +269,8 @@ suite "Async Tools":
 
     # Get minimal versions for a version range
     let pkg: PkgTuple = ("results", parseVersionRange(">= 0.4.0"))
-    let versions = waitFor getPackageMinimalVersionsFromRepoAsync(
-      repoDir, pkg, newVersion("0.4.0"), DownloadMethod.git, options, nimBin)
+    let versions = waitFor getPackageMinimalVersionsFromRepo(
+      repoDir, pkg, DownloadMethod.git, options, nimBin)
 
     # Verify we got some versions
     check versions.len > 0
@@ -463,7 +524,7 @@ suite "Async Tools":
 
     removeDir(tmpDir)
 
-  test "getPackageMinimalVersionsFromRepoAsyncFast gets versions without checkout":
+  test "getPackageMinimalVersionsFromRepo gets versions without checkout":
     let tmpDir = getTempDir() / "nimble_async_test_fast"
     let repoDir = tmpDir / "repo"
 
@@ -484,7 +545,7 @@ suite "Async Tools":
 
     # Get minimal versions using the FAST method (no checkout)
     let pkg: PkgTuple = ("results", parseVersionRange(">= 0.4.0"))
-    let versions = waitFor getPackageMinimalVersionsFromRepoAsyncFast(
+    let versions = waitFor getPackageMinimalVersionsFromRepo(
       repoDir, pkg, DownloadMethod.git, options, nimBin)
 
     # Verify we got versions

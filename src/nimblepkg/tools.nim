@@ -8,8 +8,6 @@ import compat/pegs, strutils, os, uri, sets, json, parseutils, strformat,
 
 import compat/osproc
 
-from net import SslCVerifyMode, newContext, SslContext
-
 import version, cli, common, packageinfotypes, options, sha1hashes, chronos, chronos/asyncproc
 from "$nim" / compiler/nimblecmd import getPathVersionChecksum
 
@@ -61,14 +59,26 @@ proc doCmdExAsync*(cmd: string): Future[ProcessOutput] {.async.} =
   if findExe(bin) == "":
     raise nimbleError("'" & bin & "' not in PATH.")
   displayDebug("Executing", cmd)
-  let res = await execCommandEx(cmd)
+  # Chronos uses `cmd /C` on Windows. Its command needs an outer pair of
+  # quotes so cmd preserves a quoted executable path followed by quoted args.
+  let shellCmd = when defined(windows): "\"" & cmd & "\"" else: cmd
+  let res = await execCommandEx(shellCmd)
   result = (res.stdOutput, res.status)
   displayDebug("Output", result.output)
+
+proc isOptionLike*(arg: string): bool =
+  ## True if git or hg would read `arg` as an option where a ref goes. Refs and
+  ## tags come from package authors, and options can run a command (hg's
+  ## `--config=hooks.…`) or write a file (`git show --output=…`), so such a ref
+  ## must never be passed. URLs are passed after `--` instead.
+  arg.startsWith("-")
 
 proc gitShowFile*(repoDir: string, commitish: string, filePath: string): string =
   ## Reads file content directly from git object database without checkout (sync version).
   ## commitish can be: tag name, commit hash, branch name
   ## Example: gitShowFile("/path/to/repo", "v1.0.5", "mypackage.nimble")
+  if commitish.isOptionLike:
+    raise nimbleError(&"Could not read {filePath} from {commitish}: not a ref")
   let cmd = &"git -C {repoDir.quoteShell} show {commitish.quoteShell}:{filePath.quoteShell}"
   let (output, exitCode) = doCmdEx(cmd)
   if exitCode == 0:
@@ -80,6 +90,8 @@ proc gitShowFileAsync*(repoDir: string, commitish: string, filePath: string): Fu
   ## Reads file content directly from git object database without checkout.
   ## commitish can be: tag name, commit hash, branch name
   ## Example: await gitShowFileAsync("/path/to/repo", "v1.0.5", "mypackage.nimble")
+  if commitish.isOptionLike:
+    raise nimbleError(&"Could not read {filePath} from {commitish}: not a ref")
   let cmd = &"git -C {repoDir.quoteShell} show {commitish.quoteShell}:{filePath.quoteShell}"
   let (output, exitCode) = await doCmdExAsync(cmd)
   if exitCode == 0:
@@ -91,6 +103,8 @@ proc gitListNimbleFilesInCommit*(repoDir: string, commitish: string): seq[string
   ## Lists .nimble files in a specific commit without checkout (sync version).
   ## Uses git ls-tree to list files directly from git object database.
   ## Example: gitListNimbleFilesInCommit("/path/to/repo", "v1.0.5")
+  if commitish.isOptionLike:
+    raise nimbleError(&"Could not list files in {commitish}: not a ref")
   let cmd = &"git -C {repoDir.quoteShell} ls-tree --name-only -r {commitish.quoteShell}"
   let (output, exitCode) = doCmdEx(cmd)
   if exitCode != 0:
@@ -106,6 +120,8 @@ proc gitListNimbleFilesInCommitAsync*(repoDir: string, commitish: string): Futur
   ## Lists .nimble files in a specific commit without checkout.
   ## Uses git ls-tree to list files directly from git object database.
   ## Example: await gitListNimbleFilesInCommitAsync("/path/to/repo", "v1.0.5")
+  if commitish.isOptionLike:
+    raise nimbleError(&"Could not list files in {commitish}: not a ref")
   let cmd = &"git -C {repoDir.quoteShell} ls-tree --name-only -r {commitish.quoteShell}"
   let (output, exitCode) = await doCmdExAsync(cmd)
   if exitCode != 0:
@@ -189,21 +205,22 @@ proc createDirD*(dir: string) =
   display("Creating", "directory $#" % dir, priority = LowPriority)
   createDir(dir)
 
+proc addAlphanumeric*(name: var string, text: string) =
+  ## Appends `text` with everything that is not a letter or a digit dropped, so
+  ## a URL, a version or a query string can go into a directory name.
+  for c in text:
+    case c
+    of strutils.Letters, strutils.Digits:
+      name.add c
+    else: discard
+
 proc getDownloadDirName*(uri: string, verRange: VersionRange,
                          vcsRevision: Sha1Hash): string =
   ## Creates a directory name based on the specified ``uri`` (url)
   let puri = parseUri(uri)
-  for i in puri.hostname:
-    case i
-    of strutils.Letters, strutils.Digits:
-      result.add i
-    else: discard
+  result.addAlphanumeric puri.hostname
   result.add "_"
-  for i in puri.path:
-    case i
-    of strutils.Letters, strutils.Digits:
-      result.add i
-    else: discard
+  result.addAlphanumeric puri.path
 
   let verSimple = getSimpleString(verRange)
   if verSimple != "":
@@ -288,13 +305,6 @@ proc removePackageDir*(files: seq[string], dir: string, reportSuccess = false) =
     displayWarning(
       &"Cannot completely remove the directory \"{dir}\".\n" &
        "Files not installed by Nimble are present.")
-
-proc newSSLContext*(disabled: bool): SslContext =
-  var sslVerifyMode = CVerifyPeer
-  if disabled:
-    display("Warning:", "disabling SSL certificate checking", Warning)
-    sslVerifyMode = CVerifyNone
-  return newContext(verifyMode = sslVerifyMode)
 
 when defined(instrument):
   import std/[tables, terminal, genasts]

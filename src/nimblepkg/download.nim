@@ -1,8 +1,11 @@
 # Copyright (C) Dominik Picheta. All rights reserved.
 # BSD License. Look at license.txt for more info.
 
-import parseutils, os, strutils, tables, uri, strformat,
-       httpclient, sequtils, urls, chronos, std/options
+import parseutils, os, strutils, strscans, tables, uri, strformat,
+       sequtils, urls, std/options
+
+import chronos
+import chronos/apps/http/[httpclient, httpcommon]
 
 import compat/[json, osproc]
 from algorithm import SortOrder, sorted
@@ -46,6 +49,8 @@ proc updateSubmodulesAsync(dir: string): Future[void] {.async.} =
 
 proc doCheckout*(meth: DownloadMethod, downloadDir, branch: string, options: Options): bool =
   ## Performs checkout and returns true if successful, false otherwise.
+  if branch.isOptionLike:
+    return false
   case meth
   of DownloadMethod.git:
     # Force is used here because local changes may appear straight after a clone
@@ -70,6 +75,8 @@ proc doCheckout*(meth: DownloadMethod, downloadDir, branch: string, options: Opt
 proc doCheckoutAsync*(meth: DownloadMethod, downloadDir, branch: string, options: Options): Future[bool] {.async.} =
   ## Async version of doCheckout that uses doCmdExAsync for non-blocking execution.
   ## Returns true if successful, false otherwise.
+  if branch.isOptionLike:
+    return false
   case meth
   of DownloadMethod.git:
     # Force is used here because local changes may appear straight after a clone
@@ -101,14 +108,14 @@ proc doClone(meth: DownloadMethod, url, downloadDir: string, branch = "",
       branchArg = if branch == "": "" else: &"-b {branch.quoteShell}"
     discard tryDoCmdEx(
        "git clone --config core.autocrlf=false --config core.eol=lf " &
-      &"{submoduleFlag} {depthArg} {branchArg} {url} {downloadDir.quoteShell}")
+      &"{submoduleFlag} {depthArg} {branchArg} -- {url.quoteShell} {downloadDir.quoteShell}")
     if not options.ignoreSubmodules:
       downloadDir.updateSubmodules
   of DownloadMethod.hg:
     let
       tipArg = if onlyTip: "-r tip " else: ""
       branchArg = if branch == "": "" else: &"-b {branch.quoteShell}"
-    discard tryDoCmdEx(&"hg clone {tipArg} {branchArg} {url} {downloadDir.quoteShell}")
+    discard tryDoCmdEx(&"hg clone {tipArg} {branchArg} -- {url.quoteShell} {downloadDir.quoteShell}")
 
 proc doCloneAsync*(meth: DownloadMethod, url, downloadDir: string, branch = "",
                    onlyTip = true, options: Options): Future[void] {.async.} =
@@ -121,33 +128,38 @@ proc doCloneAsync*(meth: DownloadMethod, url, downloadDir: string, branch = "",
       branchArg = if branch == "": "" else: &"-b {branch.quoteShell}"
     discard await tryDoCmdExAsync(
        "git clone --config core.autocrlf=false --config core.eol=lf " &
-      &"{submoduleFlag} {depthArg} {branchArg} {url} {downloadDir.quoteShell}")
+      &"{submoduleFlag} {depthArg} {branchArg} -- {url.quoteShell} {downloadDir.quoteShell}")
     if not options.ignoreSubmodules:
       await downloadDir.updateSubmodulesAsync()
   of DownloadMethod.hg:
     let
       tipArg = if onlyTip: "-r tip " else: ""
       branchArg = if branch == "": "" else: &"-b {branch.quoteShell}"
-    discard await tryDoCmdExAsync(&"hg clone {tipArg} {branchArg} {url} {downloadDir.quoteShell}")
+    discard await tryDoCmdExAsync(&"hg clone {tipArg} {branchArg} -- {url.quoteShell} {downloadDir.quoteShell}")
 
 proc gitFetchTags*(repoDir: string, downloadMethod: DownloadMethod, options: Options) =
   case downloadMethod:
     of DownloadMethod.git:
       let submoduleFlag = if not options.ignoreSubmodules: " --recurse-submodules" else: ""
-      tryDoCmdEx(&"git -C {repoDir} fetch --tags" & submoduleFlag)
+      # `--force`: a repository that moves a tag (nimbus-eth2's rolling
+      # `nightly`, for instance) makes a plain `fetch --tags` fail outright
+      # with "would clobber existing tag", which loses every *other* tag too
+      # and leaves the package looking versionless.
+      tryDoCmdEx(&"git -C {repoDir.quoteShell} fetch --tags --force" & submoduleFlag)
     of DownloadMethod.hg:
       # In Mercurial, pulling updates also fetches all remote tags
-      tryDoCmdEx(&"hg --cwd {repoDir} pull")
+      tryDoCmdEx(&"hg --cwd {repoDir.quoteShell} pull")
 
 proc gitFetchTagsAsync*(repoDir: string, downloadMethod: DownloadMethod, options: Options): Future[void] {.async.} =
   ## Async version of gitFetchTags that uses doCmdExAsync for non-blocking execution.
   case downloadMethod:
     of DownloadMethod.git:
       let submoduleFlag = if not options.ignoreSubmodules: " --recurse-submodules" else: ""
-      discard await tryDoCmdExAsync(&"git -C {repoDir} fetch --tags" & submoduleFlag)
+      # See gitFetchTags: --force keeps a moved tag from failing the whole fetch.
+      discard await tryDoCmdExAsync(&"git -C {repoDir.quoteShell} fetch --tags --force" & submoduleFlag)
     of DownloadMethod.hg:
       # In Mercurial, pulling updates also fetches all remote tags
-      discard await tryDoCmdExAsync(&"hg --cwd {repoDir} pull")
+      discard await tryDoCmdExAsync(&"hg --cwd {repoDir.quoteShell} pull")
 
 proc getTagsList*(dir: string, meth: DownloadMethod): seq[string] =
   var output: string
@@ -206,7 +218,7 @@ proc getTagsListRemote*(url: string, meth: DownloadMethod): seq[string] =
   result = @[]
   case meth
   of DownloadMethod.git:
-    var (output, exitCode) = doCmdEx(&"git ls-remote --tags {url}")
+    var (output, exitCode) = doCmdEx(&"git ls-remote --tags -- {url.quoteShell}")
     if exitCode != QuitSuccess:
       raise nimbleError("Unable to query remote tags for " & url &
                         " . Git returned: " & output)
@@ -227,7 +239,7 @@ proc getTagsListRemoteAsync*(url: string, meth: DownloadMethod): Future[seq[stri
   result = @[]
   case meth
   of DownloadMethod.git:
-    var (output, exitCode) = await doCmdExAsync(&"git ls-remote --tags {url}")
+    var (output, exitCode) = await doCmdExAsync(&"git ls-remote --tags -- {url.quoteShell}")
     if exitCode != QuitSuccess:
       raise nimbleError("Unable to query remote tags for " & url &
                         " . Git returned: " & output)
@@ -243,17 +255,39 @@ proc getTagsListRemoteAsync*(url: string, meth: DownloadMethod): Future[seq[stri
     # http://stackoverflow.com/questions/2039150/show-tags-for-remote-hg-repository
     raise nimbleError("Hg doesn't support remote tag querying.")
 
+proc isReleaseVersionTag*(tag: string): bool =
+  ## True if `tag` looks like a real release version tag: an optional non-digit
+  ## prefix (e.g. `v`, `release-`) followed by a numeric `N(.N)*` version. A
+  ## single-segment version (`v7`, date-like `v20240112`) is allowed only with a
+  ## `v` prefix — a bare `2024` is rejected, since releases should be namespaced
+  ## with `v` and there are no known bare single-segment versions to support.
+  ## Junk tags (`nightly`, `delete`, `201903-testnet0`, `altona_v1`,
+  ## `altair-beta`) are rejected so they don't pollute version discovery. So is
+  ## a tag git would read as an option (`--output=/x/1.0`).
+  if tag.isOptionLike:
+    return false
+  let i = skipUntil(tag, Digits)   # skip an optional non-digit prefix (e.g. `v`)
+  if i >= tag.len:
+    return false
+  let v = tag[i .. ^1]
+  var major, minor: int
+  if scanf(v, "$i.$i", major, minor):
+    return true                    # major.minor[.…]; a trailing pre-release is ignored
+  # No dot: a single segment is only a version when written `v<digits>`, so a
+  # bare number (`2024`) and an incidental trailing digit (`altona_v1`,
+  # `201903-testnet0`) are all rejected.
+  let prefix = tag[0 ..< i]
+  prefix.len == 1 and prefix[0] in {'v', 'V'} and v.allCharsInSet(Digits)
+
 proc getVersionList*(tags: seq[string]): OrderedTable[Version, string] =
   ## Return an ordered table of Version -> git tag label.  Ordering is
   ## in descending order with the most recent version first.
   let taggedVers: seq[tuple[ver: Version, tag: string]] =
     tags
-      .filterIt(it != "")
+      .filterIt(it.isReleaseVersionTag)
       .map(proc(s: string): tuple[ver: Version, tag: string] =
         # skip any chars before the version
         let i = skipUntil(s, Digits)
-        # TODO: Better checking, tags can have any
-        # names. Add warnings and such.
         result = (newVersion(s[i .. s.len-1]), s))
       .sorted(proc(a, b: (Version, string)): int = cmp(a[0], b[0]),
               SortOrder.Descending)
@@ -270,9 +304,9 @@ proc checkUrlType*(url: string, options: Options): DownloadMethod =
   ## Determines the download method based on the URL.
   if options.offline:
     raise nimbleError("Cannot check URL type in offline mode: " & url)
-  if doCmdEx("git ls-remote " & url.quoteShell()).exitCode == QuitSuccess:
+  if doCmdEx("git ls-remote -- " & url.quoteShell()).exitCode == QuitSuccess:
     return DownloadMethod.git
-  elif doCmdEx("hg identify " & url.quoteShell()).exitCode == QuitSuccess:
+  elif doCmdEx("hg identify -- " & url.quoteShell()).exitCode == QuitSuccess:
     return DownloadMethod.hg
   else:
     raise nimbleError("Unable to identify url: " & url)
@@ -295,18 +329,17 @@ proc cloneSpecificRevision(downloadMethod: DownloadMethod,
   display("Cloning", "revision: " & $vcsRevision, priority = MediumPriority)
   case downloadMethod
   of DownloadMethod.git:
-    let downloadDir = downloadDir.quoteShell
     createDir(downloadDir)
     discard tryDoCmdEx(&"git -C {downloadDir.quoteShell} init")
     discard tryDoCmdEx(&"git -C {downloadDir.quoteShell} config core.autocrlf false")
-    discard tryDoCmdEx(&"git -C {downloadDir.quoteShell} remote add origin {url}")
+    discard tryDoCmdEx(&"git -C {downloadDir.quoteShell} remote add origin -- {url.quoteShell}")
     discard tryDoCmdEx(
       &"git -C {downloadDir.quoteShell} fetch --depth 1 origin {($vcsRevision).quoteShell}")
     discard tryDoCmdEx(&"git -C {downloadDir.quoteShell} reset --hard FETCH_HEAD")
     if not options.ignoreSubmodules:
       downloadDir.updateSubmodules
   of DownloadMethod.hg:
-    discard tryDoCmdEx(&"hg clone {url} -r {($vcsRevision).quoteShell}")
+    discard tryDoCmdEx(&"hg clone -r {($vcsRevision).quoteShell} -- {url.quoteShell} {downloadDir.quoteShell}")
 
 proc cloneSpecificRevisionAsync*(downloadMethod: DownloadMethod,
                                   url, downloadDir: string,
@@ -317,18 +350,17 @@ proc cloneSpecificRevisionAsync*(downloadMethod: DownloadMethod,
   display("Cloning", "revision: " & $vcsRevision, priority = MediumPriority)
   case downloadMethod
   of DownloadMethod.git:
-    let downloadDir = downloadDir.quoteShell
     createDir(downloadDir)
     discard await tryDoCmdExAsync(&"git -C {downloadDir.quoteShell} init")
     discard await tryDoCmdExAsync(&"git -C {downloadDir.quoteShell} config core.autocrlf false")
-    discard await tryDoCmdExAsync(&"git -C {downloadDir.quoteShell} remote add origin {url}")
+    discard await tryDoCmdExAsync(&"git -C {downloadDir.quoteShell} remote add origin -- {url.quoteShell}")
     discard await tryDoCmdExAsync(
       &"git -C {downloadDir.quoteShell} fetch --depth 1 origin {($vcsRevision).quoteShell}")
     discard await tryDoCmdExAsync(&"git -C {downloadDir.quoteShell} reset --hard FETCH_HEAD")
     if not options.ignoreSubmodules:
       await downloadDir.updateSubmodulesAsync()
   of DownloadMethod.hg:
-    discard await tryDoCmdExAsync(&"hg clone {url} -r {($vcsRevision).quoteShell}")
+    discard await tryDoCmdExAsync(&"hg clone -r {($vcsRevision).quoteShell} -- {url.quoteShell} {downloadDir.quoteShell}")
 
 var tarExePathCache {.threadvar.}: string
 
@@ -358,6 +390,10 @@ proc getTarExePath: string =
             findExe("tar")
         else:
           findExe("tar")
+      elif defined(illumos):
+        # Package tarballs use --strip-components, which native tar lacks.
+        let gtar = findExe("gtar")
+        if gtar != "": gtar else: findExe("tar")
       else:
         findExe("tar")
     tarExePathCache = tarExePathCache.quoteShell
@@ -427,49 +463,65 @@ proc getGitHubApiUrl(url, commit: string): string =
   ## an URL for the GitHub REST API query for the full commit hash.
   &"https://api.github.com/repos/{extractOwnerAndRepo(url)}/commits/{commit}"
 
-proc getProxy*(): Proxy =
-  ## Returns ``nil`` if no proxy is specified.
-  var url = ""
-  try:
-    if existsEnv("http_proxy"):
-      url = getEnv("http_proxy")
-    elif existsEnv("https_proxy"):
-      url = getEnv("https_proxy")
-  except ValueError:
-    display(
-      "Warning:",
-      "Unable to parse proxy from environment: " & getCurrentExceptionMsg(),
-      Warning,
-      HighPriority,
-    )
 
-  if url.len > 0:
-    var parsed = parseUri(url)
-    if parsed.scheme.len == 0 or parsed.hostname.len == 0:
-      parsed = parseUri("http://" & url)
-    let auth =
-      if parsed.username.len > 0:
-        parsed.username & ":" & parsed.password
-      else:
-        ""
-    return newProxy($parsed, auth)
-  else:
-    return nil
+proc sendWithRedirect*(request: HttpClientRequestRef): Future[HttpClientResponseRef] {.
+     async: (raises: [CancelledError, HttpError]).} =
+    var request = request
+    var redirects = 0
+    result = await request.send()
 
-proc retrieveUrl*(url: string): string =
+    while result.status >= 300 and result.status < 400:
+      let newLocation = result.getNewLocation().valueOr:
+        raise newException(HttpRequestError, error)
+      await result.closeWait()
+      inc redirects
+      if redirects > request.session.maxRedirections:
+        raise newException(HttpRequestError, "Maximum number of redirects exceeded")
+      # Not `request.redirect(newLocation)`: it drops `maxResponseHeadersSize`,
+      # so the next response would be held to chronos's 8 KB default again.
+      var headers = request.headers
+      headers.set(HostHeader, newLocation.hostname)
+      request = HttpClientRequestRef.new(
+        request.session, newLocation, request.meth, request.version,
+        maxResponseHeadersSize = nimbleMaxResponseHeadersSize,
+        headers = headers.toList(), body = request.buffer)
+      result = await request.send()
+
+proc retrieveUrl*(url: string, disableSslCertCheck = false): Future[string] {.async.} =
   display("Http", "Requesting " & url, priority = DebugPriority)
-  {.cast(raises: [CatchableError]).}:
-    var client = newHttpClient(proxy = getProxy(), userAgent = nimbleUserAgent)
-    return client.getContent(url)
+  let flags = if disableSslCertCheck:
+    {HttpClientFlag.NoVerifyHost, HttpClientFlag.NoVerifyServerName}
+  else: {}
+  let session = HttpSessionRef.new(flags = flags, provider = getProvider())
+
+  try:
+    var request = HttpClientRequestRef.new(
+      session, url, maxResponseHeadersSize = nimbleMaxResponseHeadersSize,
+      headers = {UserAgentHeader: nimbleUserAgent}
+    ).valueOr:
+      raise newException(HttpRequestError, error)
+
+    while true:
+      let response = await request.sendWithRedirect()
+      if response.status >= 400:
+        await response.closeWait()
+        raise newException(HttpRequestError,
+                           "Server returned status: " & $response.status)
+      else:
+        let data = bytesToString(await response.getBodyBytes())
+        await response.closeWait()
+        return data
+  finally:
+    await session.closeWait()
 
 {.warning[ProveInit]: off.}
-proc getFullRevisionFromGitHubApi(url, version: string): Sha1Hash =
+proc getFullRevisionFromGitHubApi(url, version: string): Future[Sha1Hash] {.async.} =
   ## By given a commit short hash and an URL to a GitHub repository retrieves
   ## the full hash of the commit by using GitHub REST API.
   try:
     let gitHubApiUrl = getGitHubApiUrl(url, version)
     display("Get", gitHubApiUrl);
-    let content = retrieveUrl(gitHubApiUrl)
+    let content = await retrieveUrl(gitHubApiUrl)
     let json = parseJson(content)
     if json.hasKey("sha"):
       return json["sha"].str.initSha1Hash
@@ -496,22 +548,22 @@ proc parseRevision(lsRemoteOutput: string): Sha1Hash =
 proc getRevision*(url, version: string): Sha1Hash =
   ## Returns the commit hash corresponding to the given `version` of the package
   ## in repository at `url`.
-  let output = tryDoCmdEx(&"git ls-remote {url} {version}")
+  let output = tryDoCmdEx(&"git ls-remote -- {url.quoteShell} {version.quoteShell}")
   result = parseRevision(output)
   if result == notSetSha1Hash:
     if version.seemsLikeRevision:
-      result = getFullRevisionFromGitHubApi(url, version)
+      result = waitFor getFullRevisionFromGitHubApi(url, version)
     else:
       raise nimbleError(&"Cannot get revision for version \"{version}\" " &
                         &"of package at \"{url}\".")
 
 proc getRevisionAsync(url, version: string): Future[Sha1Hash] {.async.} =
   ## Async version of getRevision that uses doCmdExAsync.
-  let output = await tryDoCmdExAsync(&"git ls-remote {url} {version}")
+  let output = await tryDoCmdExAsync(&"git ls-remote -- {url.quoteShell} {version.quoteShell}")
   result = parseRevision(output)
   if result == notSetSha1Hash:
     if version.seemsLikeRevision:
-      result = getFullRevisionFromGitHubApi(url, version)
+      result = await getFullRevisionFromGitHubApi(url, version)
     else:
       raise nimbleError(&"Cannot get revision for version \"{version}\" " &
                         &"of package at \"{url}\".")
@@ -522,10 +574,10 @@ proc getTarCmdLine(downloadDir, filePath: string): string {.gcsafe.} =
   when defined(Windows):
     let downloadDir = downloadDir.replace('\\', '/')
     let filePath = filePath.replace('\\', '/')
-    &"{getTarExePath()} -C {downloadDir.quoteShell} -xf {filePath} --strip-components 1 " &
+    &"{getTarExePath()} -C {downloadDir.quoteShell} -xf {filePath.quoteShell} --strip-components 1 " &
      "--force-local"
   else:
-    &"tar -C {downloadDir.quoteShell} -xf {filePath} --strip-components 1"
+    &"{getTarExePath()} -C {downloadDir.quoteShell} -xf {filePath.quoteShell} --strip-components 1"
 
 proc doDownloadTarball(url, downloadDir, version: string, queryRevision: bool):
     Sha1Hash =
@@ -534,7 +586,7 @@ proc doDownloadTarball(url, downloadDir, version: string, queryRevision: bool):
 
   let downloadLink = getTarballDownloadLink(url, version)
   display("Downloading", downloadLink)
-  let data = retrieveUrl(downloadLink)
+  let data = waitFor retrieveUrl(downloadLink)
   display("Completed", "downloading " & downloadLink)
 
   let filePath = downloadDir / "tarball.tar.gz"
@@ -562,7 +614,7 @@ proc doDownloadTarball(url, downloadDir, version: string, queryRevision: bool):
     # path in them. For that reason here we parse the tar file content to
     # extract the symbolic links and add their paths manually to the content of
     # their files.
-    let listCmd = &"{getTarExePath()} -ztvf {filePath} --force-local"
+    let listCmd = &"{getTarExePath()} -ztvf {filePath.quoteShell} --force-local"
     let (cmdOutput, cmdExitCode) = doCmdEx(listCmd)
     if cmdExitCode != QuitSuccess:
       raise nimbleError(tryDoCmdExErrorMessage(listCmd, cmdOutput, cmdExitCode))
@@ -582,7 +634,7 @@ proc doDownloadTarballAsync*(url, downloadDir, version: string, queryRevision: b
   ## Note: HTTP download is still synchronous, but tar extraction is async.
   let downloadLink = getTarballDownloadLink(url, version)
   display("Downloading", downloadLink)
-  let data = retrieveUrl(downloadLink)
+  let data = await retrieveUrl(downloadLink)
   display("Completed", "downloading " & downloadLink)
 
   let filePath = downloadDir / "tarball.tar.gz"
@@ -599,7 +651,7 @@ proc doDownloadTarballAsync*(url, downloadDir, version: string, queryRevision: b
   display("Completed", "unpacking " & filePath)
 
   when defined(windows):
-    let listCmd = &"{getTarExePath()} -ztvf {filePath} --force-local"
+    let listCmd = &"{getTarExePath()} -ztvf {filePath.quoteShell} --force-local"
     let (cmdOutput, cmdExitCode) = await doCmdExAsync(listCmd)
     if cmdExitCode != QuitSuccess:
       raise nimbleError(tryDoCmdExErrorMessage(listCmd, cmdOutput, cmdExitCode))
@@ -613,6 +665,175 @@ proc doDownloadTarballAsync*(url, downloadDir, version: string, queryRevision: b
 
   filePath.removeFile
   return if queryRevision: await getRevisionAsync(url, version) else: notSetSha1Hash
+
+proc getCacheDownloadDir*(url: string, ver: VersionRange, options: Options, vcsRevision: Sha1Hash = notSetSha1Hash): string =
+  # Use version-agnostic cache directory ONLY for verAny (used during package discovery).
+  # This allows enumerating all versions from a single git clone.
+  # For all other version types (specific versions, ranges, special versions),
+  # use version-specific directories to ensure correct version is checked out.
+  let puri = parseUri(url)
+  var dirName = ""
+  dirName.addAlphanumeric puri.hostname
+  dirName.add "_"
+  dirName.addAlphanumeric puri.path
+  # Include query string (e.g., ?subdir=generator) to differentiate subdirectories
+  if puri.query != "":
+    dirName.add "_"
+    dirName.addAlphanumeric puri.query
+  # For any version type other than verAny, include the version in the directory name
+  # This ensures each specific version gets its own cache directory
+  if ver.kind != verAny:
+    dirName.add "_"
+    dirName.addAlphanumeric $ver
+  # When vcsRevision is specified (e.g., from lock file), include it in the cache directory
+  # This ensures exact commits get their own cache directory
+  if vcsRevision != notSetSha1Hash:
+    dirName.add "_"
+    dirName.add $vcsRevision
+  options.pkgCachePath / dirName
+
+proc hasRevision(dir, rev: string): bool =
+  ## True if `rev` names a commit this clone already has.
+  doCmdEx(&"git -C {dir.quoteShell} rev-parse --verify --quiet " &
+          (rev & "^{commit}").quoteShell).exitCode == QuitSuccess
+
+proc localTags(dir: string): OrderedTable[Version, string] =
+  ## The version tags `dir` has, empty if it cannot be read as a git repository.
+  try:
+    getTagsList(dir, DownloadMethod.git).getVersionList()
+  except CatchableError:
+    initOrderedTable[Version, string]()
+
+proc cachedClonesOf(url: string, options: Options): seq[string] =
+  ## Every clone of `url` the package cache already holds: the one version
+  ## discovery fetches all the tags into, plus one per version installed so far.
+  ## They all share the name `getCacheDownloadDir` builds out of the URL alone.
+  let base = getCacheDownloadDir(url, VersionRange(kind: verAny), options)
+  let (parent, name) = base.splitPath
+  if not dirExists(parent):
+    return
+  for kind, path in walkDir(parent):
+    if kind notin {pcDir, pcLinkToDir}:
+      continue
+    let dirName = path.splitPath.tail
+    if (dirName == name or dirName.startsWith(name & "_")) and
+       dirExists(path / ".git"):
+      result.add path
+
+proc localSourceRepo*(url: string, verRange: VersionRange, options: Options,
+                      vcsRevision: Sha1Hash): string =
+  ## A clone already in the package cache that can stand in for the remote,
+  ## empty when there is none. `nimble refresh` fetches every tag into the clone
+  ## backing version discovery, so offline that clone is the only way to install
+  ## a version that was never installed before.
+  if not options.offline:
+    return ""
+  let target = getCacheDownloadDir(url, verRange, options, vcsRevision)
+  var bestVer: Version
+  for dir in cachedClonesOf(url, options):
+    # A clone cannot populate itself.
+    if dir == target:
+      continue
+    if vcsRevision != notSetSha1Hash:
+      if dir.hasRevision($vcsRevision):
+        return dir
+    elif verRange.kind == verSpecial:
+      if verRange.spe == getHeadName(DownloadMethod.git) or
+         dir.hasRevision(substr($verRange.spe, 1)):
+        return dir
+    else:
+      # Any of these clones may be the one that has the tag being asked for, so
+      # take the one whose tags come closest to satisfying the range.
+      let latest = findLatest(verRange, localTags(dir))
+      if latest.tag.len > 0 and (result.len == 0 or latest.ver > bestVer):
+        result = dir
+        bestVer = latest.ver
+
+proc localCheckoutTarget(srcDir, refName: string): string =
+  ## What to check out after cloning `srcDir`. These clones sit on a detached
+  ## HEAD, which a plain clone leaves with no files at all, so the checkout is
+  ## not optional: without a ref to ask for, take the commit the source is on.
+  if refName.len > 0:
+    return refName
+  let head = srcDir.getVcsRevision
+  if head != notSetSha1Hash: $head else: ""
+
+proc cloneFromLocalRepo(srcDir, downloadDir, refName: string, options: Options) =
+  ## Populates `downloadDir` from another clone on this machine. Cloning a path
+  ## shares the object database, so every commit the source holds is reachable
+  ## without a network. Submodules are best-effort: their remotes are not local.
+  display("Cloning", "cached " & srcDir.extractFilename, priority = MediumPriority)
+  discard tryDoCmdEx("git clone --config core.autocrlf=false --config core.eol=lf " &
+                     &"{srcDir.quoteShell} {downloadDir.quoteShell}")
+  let target = localCheckoutTarget(srcDir, refName)
+  if target.len > 0:
+    discard tryDoCmdEx(
+      &"git -C {downloadDir.quoteShell} checkout --force {target.quoteShell}")
+  if not options.ignoreSubmodules:
+    downloadDir.updateSubmodules
+
+proc cloneFromLocalRepoAsync(srcDir, downloadDir, refName: string,
+                             options: Options): Future[void] {.async.} =
+  ## Async version of cloneFromLocalRepo.
+  display("Cloning", "cached " & srcDir.extractFilename, priority = MediumPriority)
+  discard await tryDoCmdExAsync(
+    "git clone --config core.autocrlf=false --config core.eol=lf " &
+    &"{srcDir.quoteShell} {downloadDir.quoteShell}")
+  let target = localCheckoutTarget(srcDir, refName)
+  if target.len > 0:
+    discard await tryDoCmdExAsync(
+      &"git -C {downloadDir.quoteShell} checkout --force {target.quoteShell}")
+  if not options.ignoreSubmodules:
+    await downloadDir.updateSubmodulesAsync()
+
+proc doLocalDownload(srcDir, downloadDir: string, verRange: VersionRange,
+                     options: Options, vcsRevision: Sha1Hash):
+    tuple[version: Version, vcsRevision: Sha1Hash] =
+  ## Same job as `doDownload`, served from a clone already on this machine
+  ## instead of the remote. See `localSourceRepo` for when that is possible.
+  removeDir(downloadDir)
+  if vcsRevision != notSetSha1Hash:
+    cloneFromLocalRepo(srcDir, downloadDir, $vcsRevision, options)
+    result.vcsRevision = vcsRevision
+  elif verRange.kind == verSpecial:
+    let refName =
+      if verRange.spe == getHeadName(DownloadMethod.git): ""
+      else: substr($verRange.spe, 1)
+    cloneFromLocalRepo(srcDir, downloadDir, refName, options)
+    result.version = verRange.spe
+  else:
+    # The tags are read from the clone rather than from the remote, which is
+    # the whole point: discovery already fetched them all into it.
+    let latest = findLatest(
+      verRange, getTagsList(srcDir, DownloadMethod.git).getVersionList())
+    cloneFromLocalRepo(srcDir, downloadDir, latest.tag, options)
+    result.version =
+      if $latest.ver != "": latest.ver else: getHeadName(DownloadMethod.git)
+  if result.vcsRevision == notSetSha1Hash:
+    result.vcsRevision = downloadDir.getVcsRevision
+
+proc doLocalDownloadAsync(srcDir, downloadDir: string, verRange: VersionRange,
+                          options: Options, vcsRevision: Sha1Hash):
+    Future[tuple[version: Version, vcsRevision: Sha1Hash]] {.async.} =
+  ## Async version of doLocalDownload.
+  removeDir(downloadDir)
+  if vcsRevision != notSetSha1Hash:
+    await cloneFromLocalRepoAsync(srcDir, downloadDir, $vcsRevision, options)
+    result.vcsRevision = vcsRevision
+  elif verRange.kind == verSpecial:
+    let refName =
+      if verRange.spe == getHeadName(DownloadMethod.git): ""
+      else: substr($verRange.spe, 1)
+    await cloneFromLocalRepoAsync(srcDir, downloadDir, refName, options)
+    result.version = verRange.spe
+  else:
+    let latest = findLatest(
+      verRange, (await getTagsListAsync(srcDir, DownloadMethod.git)).getVersionList())
+    await cloneFromLocalRepoAsync(srcDir, downloadDir, latest.tag, options)
+    result.version =
+      if $latest.ver != "": latest.ver else: getHeadName(DownloadMethod.git)
+  if result.vcsRevision == notSetSha1Hash:
+    result.vcsRevision = downloadDir.getVcsRevision
 
 {.warning[ProveInit]: off.}
 proc doDownload(url, downloadDir: string, verRange: VersionRange,
@@ -893,7 +1114,8 @@ proc downloadPkg*(url: string, verRange: VersionRange,
                   downloadPath: string,
                   vcsRevision: Sha1Hash,
                   nimBin: Option[string],
-                  validateRange = true): DownloadPkgResult =
+                  validateRange = true,
+                  writeMetaData = true): DownloadPkgResult =
   ## Downloads the repository as specified by ``url`` and ``verRange`` using
   ## the download method specified.
   ##
@@ -905,6 +1127,10 @@ proc downloadPkg*(url: string, verRange: VersionRange,
   ## ``vcsRevision``
   ##   If specified this parameter will cause specific VCS revision to be
   ##   checked out.
+  ##
+  ## ``writeMetaData``
+  ##   Records the url and revision in a `nimblemeta.json`. Off for directories
+  ##   the user works in, where git is the live answer and a snapshot is a lie.
 
   let (downloadDir, pkgDir) = downloadPkgDir(url, verRange, subdir, options, vcsRevision, downloadPath)
   result.dir = pkgDir
@@ -913,31 +1139,43 @@ proc downloadPkg*(url: string, verRange: VersionRange,
   if isCacheValid(result.dir, downloadDir, downloadPath, verRange, options):
     return
 
-  if options.offline:
+  # Offline, the clone version discovery keeps for this URL can stand in for the
+  # remote: it holds every tag discovery ever saw, so a version that was never
+  # installed is still installable from it.
+  let localSrc = localSourceRepo(url, verRange, options, vcsRevision)
+  if localSrc.len == 0 and options.offline:
     raise nimbleError("Cannot download in offline mode.")
 
   let modUrl = modifyUrl(url, options.config.cloneUsingHttps)
 
-  let downloadMethod = if downloadTarball(modUrl, options):
-    "http" else: $downMethod
-
-  let verStr = if verRange.kind == verAny: "" else: " (" & $verRange & ")"
-  let category = if options.satResult.pass != satDone: "Fetching" else: "Downloading"
-  if subdir.len > 0:
-    display(category, "$1$2 using $3 (subdir is '$4')" %
-                           [modUrl, verStr, downloadMethod, subdir],
-            priority = HighPriority)
+  if localSrc.len > 0:
+    (result.version, result.vcsRevision) = doLocalDownload(
+      localSrc, downloadDir, verRange, options, vcsRevision)
   else:
-    display(category, "$1$2 using $3" % [modUrl, verStr, downloadMethod],
-            priority = HighPriority)
+    let downloadMethod = if downloadTarball(modUrl, options):
+      "http" else: $downMethod
 
-  (result.version, result.vcsRevision) = doDownload(
-    modUrl, downloadDir, verRange, downMethod, options, vcsRevision)
+    let verStr = if verRange.kind == verAny: "" else: " (" & $verRange & ")"
+    let category = if options.satResult.pass != satDone: "Fetching" else: "Downloading"
+    if subdir.len > 0:
+      display(category, "$1$2 using $3 (subdir is '$4')" %
+                             [modUrl, verStr, downloadMethod, subdir],
+              priority = HighPriority)
+    else:
+      display(category, "$1$2 using $3" % [modUrl, verStr, downloadMethod],
+              priority = HighPriority)
+
+    (result.version, result.vcsRevision) = doDownload(
+      modUrl, downloadDir, verRange, downMethod, options, vcsRevision)
   
-  var metaData = initPackageMetaData()
-  metaData.url = modUrl
-  metaData.vcsRevision = result.vcsRevision
-  saveMetaData(metaData, result.dir)
+  # Skipped for a develop checkout: there the directory is the user's own source
+  # tree, git already answers both questions, and a file frozen at clone time
+  # would go stale the moment they commit.
+  if writeMetaData:
+    var metaData = initPackageMetaData()
+    metaData.url = modUrl
+    metaData.vcsRevision = result.vcsRevision
+    saveMetaData(metaData, result.dir)
 
   var pkgInfo: PackageInfo
   ## Makes sure that the downloaded package's version satisfies the requested
@@ -960,7 +1198,8 @@ proc downloadPkgAsync*(url: string, verRange: VersionRange,
                        downloadPath: string,
                        vcsRevision: Sha1Hash,
                        nimBin: Option[string],
-                       validateRange = true): Future[DownloadPkgResult] {.async.} =
+                       validateRange = true,
+                       writeMetaData = true): Future[DownloadPkgResult] {.async.} =
   ## Async version of downloadPkg that uses async operations for cloning and downloading.
   ## Downloads the repository as specified by ``url`` and ``verRange`` using
   ## the download method specified.
@@ -973,6 +1212,10 @@ proc downloadPkgAsync*(url: string, verRange: VersionRange,
   ## ``vcsRevision``
   ##   If specified this parameter will cause specific VCS revision to be
   ##   checked out.
+  ##
+  ## ``writeMetaData``
+  ##   Records the url and revision in a `nimblemeta.json`. Off for directories
+  ##   the user works in, where git is the live answer and a snapshot is a lie.
 
   let (downloadDir, pkgDir) = downloadPkgDir(url, verRange, subdir, options, vcsRevision, downloadPath)
   result.dir = pkgDir
@@ -981,31 +1224,43 @@ proc downloadPkgAsync*(url: string, verRange: VersionRange,
   if isCacheValid(result.dir, downloadDir, downloadPath, verRange, options):
     return
 
-  if options.offline:
+  # Offline, the clone version discovery keeps for this URL can stand in for the
+  # remote: it holds every tag discovery ever saw, so a version that was never
+  # installed is still installable from it.
+  let localSrc = localSourceRepo(url, verRange, options, vcsRevision)
+  if localSrc.len == 0 and options.offline:
     raise nimbleError("Cannot download in offline mode.")
 
   let modUrl = modifyUrl(url, options.config.cloneUsingHttps)
 
-  let downloadMethod = if downloadTarball(modUrl, options):
-    "http" else: $downMethod
-
-  let verStr = if verRange.kind == verAny: "" else: " (" & $verRange & ")"
-  let category = if options.satResult.pass != satDone: "Fetching" else: "Downloading"
-  if subdir.len > 0:
-    display(category, "$1$2 using $3 (subdir is '$4')" %
-                           [modUrl, verStr, downloadMethod, subdir],
-            priority = HighPriority)
+  if localSrc.len > 0:
+    (result.version, result.vcsRevision) = await doLocalDownloadAsync(
+      localSrc, downloadDir, verRange, options, vcsRevision)
   else:
-    display(category, "$1$2 using $3" % [modUrl, verStr, downloadMethod],
-            priority = HighPriority)
+    let downloadMethod = if downloadTarball(modUrl, options):
+      "http" else: $downMethod
 
-  (result.version, result.vcsRevision) = await doDownloadAsync(
-    modUrl, downloadDir, verRange, downMethod, options, vcsRevision)
+    let verStr = if verRange.kind == verAny: "" else: " (" & $verRange & ")"
+    let category = if options.satResult.pass != satDone: "Fetching" else: "Downloading"
+    if subdir.len > 0:
+      display(category, "$1$2 using $3 (subdir is '$4')" %
+                             [modUrl, verStr, downloadMethod, subdir],
+              priority = HighPriority)
+    else:
+      display(category, "$1$2 using $3" % [modUrl, verStr, downloadMethod],
+              priority = HighPriority)
 
-  var metaData = initPackageMetaData()
-  metaData.url = modUrl
-  metaData.vcsRevision = result.vcsRevision
-  saveMetaData(metaData, result.dir)
+    (result.version, result.vcsRevision) = await doDownloadAsync(
+      modUrl, downloadDir, verRange, downMethod, options, vcsRevision)
+
+  # Skipped for a develop checkout: there the directory is the user's own source
+  # tree, git already answers both questions, and a file frozen at clone time
+  # would go stale the moment they commit.
+  if writeMetaData:
+    var metaData = initPackageMetaData()
+    metaData.url = modUrl
+    metaData.vcsRevision = result.vcsRevision
+    saveMetaData(metaData, result.dir)
 
   var pkgInfo: PackageInfo
   ## Makes sure that the downloaded package's version satisfies the requested
@@ -1021,15 +1276,25 @@ proc downloadPkgAsync*(url: string, verRange: VersionRange,
     #ideally we should be able to know the version we are downloading upfront
     #as for the constraints we need a way to invalidate the cache entry so it doesnt get outdated
 
-proc echoPackageVersions*(pkg: Package) =
+proc echoPackageVersions*(pkg: Package,
+                          verRange = VersionRange(kind: verAny)) =
   let downMethod = pkg.downloadMethod
   case downMethod
   of DownloadMethod.git:
     try:
       let versions = getTagsListRemote(pkg.url, downMethod).getVersionList()
-      if versions.len > 0:
-        let sortedVersions = toSeq(values(versions))
+      # `satisfiesConstraint` rather than `withinRange`: these are the tags the
+      # remote actually has, so a special requirement must not be reported as
+      # satisfied by every tagged version.
+      var sortedVersions: seq[string] = @[]
+      for ver, tag in versions.pairs:
+        if ver.satisfiesConstraint(verRange):
+          sortedVersions.add tag
+      if sortedVersions.len > 0:
         displayInfoLine("  versions:    ", join(sortedVersions, ", "))
+      elif versions.len > 0:
+        displayInfoLine("  versions:    ",
+                        "(No tagged versions match " & $verRange & ")")
       else:
         displayInfoLine("  versions:    ", "(No versions tagged in the remote repository)")
     except CatchableError:
@@ -1043,15 +1308,22 @@ proc echoPackageVersions*(pkg: Package) =
 proc removeTrailingSlash(s: string): string =
   s.strip(chars = {'/'}, leading = false)
 
-proc getDevelopDownloadDir*(url, subdir: string, options: Options): string =
+proc getDevelopDownloadDir*(url, subdir: string, options: Options,
+    canonicalName: string = ""): string =
   ## Returns the download dir for a develop mode dependency.
+  ##
+  ## If `canonicalName` is provided (i.e. the resolved package name from
+  ## packages.json), the vendor directory uses it. Otherwise the URL's path
+  ## tail is used. 
   assert isURL(url), &"The string \"{url}\" is not a URL."
 
   let url = url.removeTrailingSlash
   let subdir = subdir.removeTrailingSlash
 
   let downloadDirName =
-    if subdir.len == 0:
+    if canonicalName.len > 0 and subdir.len == 0:
+      canonicalName
+    elif subdir.len == 0:
       parseUri(url).path.splitFile.name
     else:
       subdir.splitFile.name
@@ -1062,7 +1334,7 @@ proc getDevelopDownloadDir*(url, subdir: string, options: Options): string =
     else:
       getCurrentDir() / options.action.path / downloadDirName
 
-proc refresh*(options: Options) =
+proc refresh*(options: Options) {.async.} =
   ## Downloads the package list from the specified URL.
   ##
   ## If the download is not successful, an exception is raised.
@@ -1078,17 +1350,17 @@ proc refresh*(options: Options) =
   if parameter.len > 0:
     if parameter.isUrl:
       let cmdLine = PackageList(name: "commandline", urls: @[parameter])
-      fetchList(cmdLine, options)
+      await fetchList(cmdLine, options)
     else:
       if parameter notin options.config.packageLists:
         let msg = "Package list with the specified name not found."
         raise nimbleError(msg)
 
-      fetchList(options.config.packageLists[parameter], options)
+      await fetchList(options.config.packageLists[parameter], options)
   else:
     # Try each package list in config
     for name, list in options.config.packageLists:
-      fetchList(list, options)
+      await fetchList(list, options)
 
 proc getDownloadInfo*(
     pv: PkgTuple, options: Options,
@@ -1097,6 +1369,9 @@ proc getDownloadInfo*(
 ): (DownloadMethod, string, Table[string, string]) =
 
   # echo "getDownloadInfo:pv.name: ", $pv.name
+  # getPackage refreshes missing package lists during the initial lookup.
+  # Remember that state so a miss does not immediately refresh them again.
+  let packageListsWereMissing = needsRefresh(options)
   var pkg = initPackage()
   if getPackage(pv.name, options, pkg, ignorePackageCache):
     let (url, metadata) = getUrlData(pkg.url)
@@ -1115,10 +1390,10 @@ proc getDownloadInfo*(
   else:
     # If package is not found give the user a chance to refresh
     # package.json
-    if doPrompt and not options.offline and
+    if doPrompt and not packageListsWereMissing and not options.offline and
         options.prompt(pv.name & " not found in any local packages.json, " &
                         "check internet for updated packages?"):
-      refresh(options)
+      waitFor refresh(options)
 
       # Once we've refreshed, try again, but don't prompt if not found
       # (as we've already refreshed and a failure means it really

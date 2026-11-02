@@ -1,4 +1,4 @@
-# Copyright (C) Dominik Picheta. All rights reserved.
+# Copyright (C) the Nimble contributors. All rights reserved.
 # BSD License. Look at license.txt for more info.
 
 {.used.}
@@ -10,6 +10,18 @@ from nimblepkg/version import newVersion
 from nimblepkg/displaymessages import cannotUninstallPkgMsg
 
 suite "issues":
+  test "action help does not require a nimble file (#1791)":
+    let tempDir = getTempDir() / "nimble_help_without_package"
+    removeDir(tempDir)
+    createDir(tempDir)
+    defer: removeDir(tempDir)
+
+    cd tempDir:
+      let (output, exitCode) = execNimble("upgrade", "--help")
+      check exitCode == QuitSuccess
+      check output.contains("Nimble Options:")
+      check not output.contains("Could not find a .nimble file")
+
   test "test params":
     cd "testParams":
       let (output, exitCode) = execNimbleYes("test", "Passing test")
@@ -88,7 +100,7 @@ suite "issues":
   test "do not install single dependency multiple times (#678)":
     # for the test to be correct, the tested package and its dependencies must not
     # exist in the local cache
-    removeDir("nimbleDir")
+    removeDir(installDir)
     cd "issue678":
       testRefresh():
         writeFile(configFile, """
@@ -395,8 +407,9 @@ suite "issues":
       inLines(lines, "check internet for updated packages")
       inLines(lines, "fusion installed successfully")
 
-    # Clean up package file
-    check execNimble(["refresh"]).exitCode == QuitSuccess
+    # Clean up package file. Only the list is of interest here; outside a
+    # package a plain refresh would go on to refresh every global package.
+    check execNimble(["refresh", "--packageListOnly"]).exitCode == QuitSuccess
 
   test "issue #1158":
     cd "issue1158":
@@ -426,7 +439,7 @@ suite "issues":
         discard
   
   test "issue #1454":
-    removeDir("nimbleDir")
+    removeDir(installDir)
     cd "issue1454":
       let (_, exitCode) = execNimble("setup")
       check exitCode == QuitSuccess
@@ -490,6 +503,30 @@ requires "nim >= 2.0.0"
       checkWrapperInvoked(binDir / "calls.log", "--useSystemNim", "--debug", "build")
       putEnv("PATH", oldPath)
 
+  test "issue #1757 useSystemNim works with a Debian-style nim layout":
+    # Debian's apt `nim` package installs the compiler at /usr/bin/nim and the
+    # stdlib at /usr/lib/nim, with no nim.nimble next to either. getNimFromSystem
+    # then can't reconstruct a PackageInfo and used to return `none`, so
+    # --useSystemNim failed with "No system nim found" even though nim was on
+    # PATH. The wrapper reproduces that layout by faking querySetting(libPath).
+    let binDir = getCurrentDir() / "issue1757" / "bin"
+    let nimWrapper = binDir / (when defined(windows): "nim.cmd" else: "nim")
+    let log = binDir / "calls.log"
+    cd "issue1757":
+      cleanFiles log, "issue1757"
+      let sep = when defined(windows): ";" else: ":"
+      let oldPath = getEnv("PATH")
+      putEnv("PATH", binDir & sep & oldPath)
+      let res = execNimble("--useSystemNim", "--debug", "build")
+      putEnv("PATH", oldPath)
+      check res.exitCode == QuitSuccess
+      check not res.output.contains("No system nim found")
+      # The build must have gone through the system nim (our wrapper), proving
+      # it was detected rather than a fresh nim being downloaded.
+      check res.output.contains("Executing $1 c" % nimWrapper)
+      check fileExists(log)
+      check readFile(log).contains("c ")
+
   test "issue #1650 root project config.nims should not leak into dep binary build":
     # When building a dependency's binary in nimbledeps/buildtemp, the root
     # project's config.nims should NOT be picked up by the Nim compiler. This
@@ -552,3 +589,90 @@ task hello, "hello":
       check output.contains("hello")
       # The key assertion: no newer version should be installed
       check not output.contains("Installing checksums")
+
+  test "useSystemNim install --depsOnly resolves freshly-fetched deps (confutils CI regression)":
+    # Regression: `nimble --useSystemNim install --depsOnly` on a project whose
+    # dependencies are not yet installed failed with
+    # "Package not found in solution: results <ver>".
+    #
+    # The --useSystemNim path runs the SAT solver while nimBin is still
+    # unresolved. Resolving a freshly-fetched dependency raises NeedsNimBinError,
+    # which makes withNimBinFallback retry the whole resolution. On the retry,
+    # solvedPkgs still held the solution from the first (aborted) pass, so
+    # solveLocalPackages' failure left it non-empty and solvePackages took the
+    # local-solve early-return — skipping full resolution and never queueing the
+    # deps for install.
+    let tmpDir = getTempDir() / "tissue_confutils_depsonly"
+    removeDir(tmpDir)
+    createDir(tmpDir)
+    defer: removeDir(tmpDir)
+
+    writeFile(tmpDir / "confutilsrepro.nimble", """
+version = "0.1.0"
+author = "test"
+description = "test"
+license = "MIT"
+requires "results"
+""")
+
+    # A fresh nimbleDir ensures `results` is discovered/fetched rather than
+    # resolved from installed packages — that is what exercises the retry path.
+    let nimbleDir = tmpDir / "nimbledir"
+    cd tmpDir:
+      let (output, exitCode) = execNimbleYes(
+        "--useSystemNim", "--nimbleDir:" & nimbleDir, "install", "--depsOnly")
+      checkpoint output
+      check exitCode == QuitSuccess
+      check not output.contains("Package not found in solution")
+  test "issue 1827. Match url requires to lock file properly":
+    let tmpDir = getTempDir() / "tissue_1827"
+    removeDir(tmpDir)
+    createDir(tmpDir)
+    defer:  removeDir(tmpDir)
+    writeFile(tmpDir / "tissue_1827.nimble", """
+version = "0.1.0"
+author = "test"
+description = "test"
+license = "MIT"
+requires "jsony"
+requires "https://github.com/arnetheduck/nim-results"
+""")
+    writeFile(tmpDir / "nimble.lock", """
+{
+  "version": 2,
+  "packages": {
+    "results": {
+      "version": "0.5.1",
+      "vcsRevision": "df8113dda4c2d74d460a8fa98252b0b771bf1f27",
+      "url": "https://github.com/arnetheduck/nim-results",
+      "downloadMethod": "git",
+      "dependencies": ["nim"],
+      "checksums": {"sha1": "a9c011f74bc9ed5c91103917b9f382b12e82a9e7"}
+    },
+    "jsony": {
+      "version": "1.1.4",
+      "vcsRevision": "981f868cfca6e2ccde820cc20bb18d835d283233",
+      "url": "https://github.com/treeform/jsony",
+      "downloadMethod": "git",
+      "dependencies": ["nim"],
+      "checksums": {"sha1": "0b40135953033a217eb163e2a73d1e628216a9aa"}
+    }
+  },
+  "tasks": {}
+}
+""")
+    let nimbleDir = tmpDir / "nimbledir"
+    cd tmpDir:
+      let (output, exitCode) = execNimbleYes(
+        "--nimbleDir:" & nimbleDir, "deps",  "--format:json"
+      )
+      checkpoint output
+      check exitCode == QuitSuccess
+      check output.contains("""
+    "name": "jsony",
+    "version": "@any",
+    "resolvedTo": "1.1.4",
+""")
+
+
+

@@ -110,5 +110,17 @@ suite "requires flag":
     cd "requireflag":
       let (outp, exitCode) = execNimble("--requires:nim#devel", "install")
       check exitCode == QuitSuccess
-      # Check that nim#devel was processed (either compiled from source or already installed)
-      check outp.contains("Nim #devel") or outp.contains("nim-devel")
+      # Check that nim#devel was processed: downloaded or compiled ("Nim #devel
+      # ..."), or an already extracted one reused ("using .../nim-#devel-<sha>/bin/nim")
+      check outp.contains("Nim #devel") or outp.contains("nim-#devel") or
+            outp.contains("nim-devel")
+
+  test "issue #1768: nimble run works with a special nim version":
+    cd "nimrunspecial":
+      let (_, buildCode) = execNimble("--requires:nim#devel", "build")
+      check buildCode == QuitSuccess
+      let (runOut, runCode) = execNimble("--requires:nim#devel", "run")
+      check runCode == QuitSuccess
+      check not runOut.contains("not in PATH")
+      check not runOut.contains("Build failed for the package")
+      check runOut.contains("nimrunspecial-ran-ok")

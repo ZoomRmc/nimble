@@ -20,6 +20,9 @@ type
   PackageNotFoundError* = object of NimbleError
     ## Raised when a package cannot be found in any repository
 
+  ResolutionFailureError* = object of NimbleError
+    ## Raised when dependency or Nim selection has no usable solution.
+
   NeedsNimBinError* = object of NimbleError
     ## Raised when a Nim binary is needed but nimBin is not yet resolved.
     ## Callers catch this and retry after bootstrap resolution.
@@ -45,8 +48,10 @@ proc getVersionFromNimble(): string =
 const
   nimbleVersion* = getVersionFromNimble()
   nimbleUserAgent* = "nimble/" & nimbleVersion
+  nimbleMaxResponseHeadersSize* = 64 * 1024
+    ## chronos's HTTP client fails on response headers over 8 KB, its default.
+    ## GitHub sends about 5 KB and was briefly over (#1903).
   nimblePackagesDirName* = "pkgs2"
-  nimblePackagesLinksDirName* ="links"
   nimbleBinariesDirName* = "bin"
 
 proc newNimbleError*[ErrorType](msg: string, hint = "",
@@ -58,6 +63,11 @@ proc newNimbleError*[ErrorType](msg: string, hint = "",
 proc nimbleError*(msg: string, hint = "", details: ref CatchableError = nil):
     ref NimbleError =
   newNimbleError[NimbleError](msg, hint, details)
+
+proc resolutionFailureError*(msg: string, hint = "",
+                             details: ref CatchableError = nil):
+    ref ResolutionFailureError =
+  newNimbleError[ResolutionFailureError](msg, hint, details)
 
 proc buildFailed*(msg: string, details: ref CatchableError = nil):
     ref BuildFailed =
@@ -113,8 +123,3 @@ template cdNewDir*(dir: string, body: untyped) =
   cd dir:
     body
 
-proc getLinkFileDir*(pkgName: string): string =
-  pkgName & "-#head"
-
-proc getLinkFileName*(pkgName: string): string =
-  pkgName & ".nimble-link"

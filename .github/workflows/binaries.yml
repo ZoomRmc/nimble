@@ -15,18 +15,25 @@ jobs:
       fail-fast: false
       matrix:
         target:
+          # Linux: build with Nim 2.2.12 in a native per-arch container under
+          # QEMU. musl-gcc produces the same static musl release binaries.
           - os: linux
             triple: x86_64-linux-musl
             name: linux_x64
+            platform: linux/amd64
           - os: linux
             triple: i686-linux-musl
             name: linux_x32
+            platform: linux/386
           - os: linux
             triple: aarch64-linux-musl
             name: linux_aarch64
+            platform: linux/arm64
           - os: linux
             triple: armv7l-linux-musleabihf
             name: linux_armv7l
+            platform: linux/arm/v7
+          # macOS: native/cross via clang -target, universal via lipo
           - os: macosx
             triple: x86_64-apple-darwin14
             name: macosx_x64
@@ -36,12 +43,19 @@ jobs:
           - os: macosx
             triple: universal-apple-darwin
             name: macosx_universal
+          # Windows: single llvm-mingw toolchain targets both arches
           - os: windows
             triple: x86_64-w64-mingw32
             name: windows_x64
+            nimCpu: amd64
+            cc: x86_64-w64-mingw32-gcc
+            windres: x86_64-w64-mingw32-windres
           - os: windows
             triple: i686-w64-mingw32
             name: windows_x32
+            nimCpu: i386
+            cc: i686-w64-mingw32-gcc
+            windres: i686-w64-mingw32-windres
         include:
           - target:
               os: linux
@@ -65,33 +79,80 @@ jobs:
           fetch-depth: 0
           submodules: recursive
 
+      # Linux builds happen inside a container that already carries Nim, so the
+      # host Nim toolchain is only set up for macOS/Windows.
       - uses: jiro4989/setup-nim-action@v2
+        if: matrix.target.os != 'linux'
         with:
-          nim-version: "stable"
+          nim-version: "2.2.12"
           yes: true
 
       - name: Install dependencies
+        if: matrix.target.os != 'linux'
         run: nimble install -y
 
-      - name: Install zip
+      # A single llvm-mingw toolchain can target every Windows arch (i686,
+      # x86_64, armv7, arm64) and runs natively on the Windows runner, so it
+      # fixes windows_x32 (previously built as 64-bit).
+      - name: Setup llvm-mingw toolchain
         if: matrix.target.os == 'windows'
-        run: choco install zip
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -eu
+          tag=$(curl -fsSL -H "Authorization: Bearer $GH_TOKEN" \
+            https://api.github.com/repos/mstorsjo/llvm-mingw/releases/latest \
+            | grep '"tag_name"' | head -1 | sed -E 's/.*"tag_name": *"([^"]+)".*/\1/')
+          pkg="llvm-mingw-${tag}-ucrt-x86_64"
+          curl -fsSL "https://github.com/mstorsjo/llvm-mingw/releases/download/${tag}/${pkg}.zip" -o "$RUNNER_TEMP/llvm-mingw.zip"
+          unzip -q "$RUNNER_TEMP/llvm-mingw.zip" -d "$RUNNER_TEMP/llvm-mingw"
+          echo "$RUNNER_TEMP/llvm-mingw/${pkg}/bin" >> "$GITHUB_PATH"
+
+      # Register binfmt handlers so non-native (arm64/armv7/i686) containers run.
+      - name: Set up QEMU
+        if: matrix.target.os == 'linux'
+        uses: docker/setup-qemu-action@v3
+
+      - name: build nimble (Linux, static musl)
+        if: matrix.target.os == 'linux'
+        env:
+          PLATFORM: ${{ matrix.target.platform }}
+        run: |
+          set -eu
+          docker run --rm --platform "$PLATFORM" \
+            -v "$PWD":/ws -w /ws nim:2.2.12 \
+            sh -euc '
+              apt-get update
+              DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends musl-tools
+              nim --version
+              # config.nims wires all vendor/ deps, so no "nimble install" is needed.
+              nim c -d:release --gcc.exe:musl-gcc --gcc.linkerexe:musl-gcc \
+                --passL:"-static" -o:src/nimble src/nimble.nim
+            '
 
       - name: build nimble
+        if: matrix.target.os != 'linux'
+        env:
+          TRIPLE: ${{ matrix.target.triple }}
+          TARGET_OS: ${{ matrix.target.os }}
+          CC_BIN: ${{ matrix.target.cc }}
+          NIM_CPU: ${{ matrix.target.nimCpu }}
+          WINDRES: ${{ matrix.target.windres }}
         run: |
-          if [[ "${{ matrix.target.triple }}" == "x86_64-apple-darwin14" ]]; then
+          set -eu
+          if [[ "$TRIPLE" == "x86_64-apple-darwin14" ]]; then
             nim c -d:release \
             -d:zippyNoSimd \
             --passL:"-target x86_64-apple-macos10.15" \
             --passC:"-target x86_64-apple-macos10.15" \
             src/nimble.nim;
-          elif [[ "${{ matrix.target.triple }}" == "aarch64-apple-darwin" ]]; then
+          elif [[ "$TRIPLE" == "aarch64-apple-darwin" ]]; then
             nim c -d:release \
             -d:zippyNoSimd \
             --passL:"-target arm64-apple-macos11" \
             --passC:"-target arm64-apple-macos11" \
             src/nimble.nim;
-          elif [[ "${{ matrix.target.triple }}" == "universal-apple-darwin" ]]; then
+          elif [[ "$TRIPLE" == "universal-apple-darwin" ]]; then
             nim c -d:release \
             -d:zippyNoSimd \
             --passL:"-target x86_64-apple-macos10.15" \
@@ -104,25 +165,52 @@ jobs:
             -o:src/nimble_arm64 src/nimble.nim;
             lipo -create src/nimble_x64 src/nimble_arm64 -output src/nimble;
           else
-            nim -d:release c src/nimble.nim;
+            # Windows, via llvm-mingw.
+            "$WINDRES" src/nimble.rc -O coff -o "$RUNNER_TEMP/nimble_res.o"
+            nim c -d:release \
+            --os:windows --cpu:"$NIM_CPU" \
+            --gcc.exe:"$CC_BIN" --gcc.linkerexe:"$CC_BIN" \
+            --"$NIM_CPU".windows.gcc.exe:"$CC_BIN" --"$NIM_CPU".windows.gcc.linkerexe:"$CC_BIN" \
+            --passL:"-static" --passL:"$RUNNER_TEMP/nimble_res.o" \
+            src/nimble.nim;
           fi
 
-      - name: Download OpenSSL DLLs
-        if: matrix.target.os == 'windows'
+      # Confirm each binary is the architecture it claims to be (the exact check
+      # from issue #1123). Fails the job loudly if an arch is wrong.
+      - name: Verify binary architecture
+        if: matrix.target.os != 'macosx'
+        env:
+          TARGET_OS: ${{ matrix.target.os }}
         run: |
-          curl -sL "https://nim-lang.org/download/dlls.zip" -o dlls.zip
-          unzip -o dlls.zip -d src/ "libcrypto-*.dll" "libssl-*.dll" "cacert.pem"
+          set -eu
+          if [[ "$TARGET_OS" == "windows" ]]; then
+            file src/nimble.exe
+            llvm-readobj --coff-resources src/nimble.exe | grep -q 'MANIFEST'
+          else
+            file src/nimble
+            if [[ "$TARGET_OS" == "linux" ]]; then
+              file src/nimble | grep -q 'statically linked'
+            fi
+          fi
 
       - name: Compress binaries
+        env:
+          TARGET_OS: ${{ matrix.target.os }}
+          ASSET: ${{ matrix.target.name }}
         run: |
           cd src
-          if [[ "${{ matrix.target.os }}" == "windows" ]]; then
-            # Create both formats for Windows (include OpenSSL DLLs)
-            tar -c -z -v -f ../nimble-${{ matrix.target.name }}.tar.gz nimble.exe libcrypto-*.dll libssl-*.dll cacert.pem
-            zip ../nimble-${{ matrix.target.name }}.zip nimble.exe libcrypto-*.dll libssl-*.dll cacert.pem
+          if [[ "$TARGET_OS" == "windows" ]]; then
+            tar -c -z -v -f "../nimble-${ASSET}.tar.gz" nimble.exe
           else
-            tar -c -z -v -f ../nimble-${{ matrix.target.name }}.tar.gz nimble
+            tar -c -z -v -f "../nimble-${ASSET}.tar.gz" nimble
           fi
+
+      - name: Compress Windows zip
+        if: matrix.target.os == 'windows'
+        shell: pwsh
+        env:
+          ASSET: ${{ matrix.target.name }}
+        run: Compress-Archive -LiteralPath src/nimble.exe -DestinationPath "nimble-$env:ASSET.zip" -Force
 
       - name: Upload tar.gz artifact
         uses: actions/upload-artifact@v7

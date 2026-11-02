@@ -1,4 +1,4 @@
-# Copyright (C) Dominik Picheta. All rights reserved.
+# Copyright (C) the Nimble contributors. All rights reserved.
 # BSD License. Look at license.txt for more info.
 
 {.used.}
@@ -35,6 +35,36 @@ suite "Task level dependencies":
       check exitCode == QuitSuccess
       check packageDirExists(pkgsDir, "benchy-0.0.1")
 
+  test "Dependency is used when taskRequires is spelled taskrequires (#1889)":
+    # Nim reads `taskrequires` as `taskRequires`, so nimble has to as well.
+    let dir = getTempDir() / "taskdeps-lowercase"
+    removeDir dir
+    createDir dir
+    defer: removeDir dir
+    writeFile(dir / "lowercase.nimble", """
+version       = "0.1.0"
+author        = "John Doe"
+description   = "taskRequires written in lowercase"
+license       = "MIT"
+
+requires "nim >= 0.19.0"
+
+taskrequires "benchmark", "benchy == 0.0.1"
+
+task benchmark, "Runs benchmarks":
+  setCommand("c", "benchmark")
+""")
+    writeFile(dir / "benchmark.nim", """
+import benchy
+
+timeIt "test":
+  discard
+""")
+    cd dir:
+      let (_, exitCode) = execNimbleYes("benchmark")
+      check exitCode == QuitSuccess
+      check packageDirExists(pkgsDir, "benchy-0.0.1")
+
 
   test "Dependency is not used when not running task":
     inDir:
@@ -64,7 +94,7 @@ suite "Task level dependencies":
       check tasks["test"]["unittest2"]["version"].getStr() == "0.0.4"
 
   test "Task dependencies from lock file are used":
-    removeDir("nimbleDir")
+    removeDir(installDir)
     inDir:
       makeLockFile()
       uninstallDeps()
@@ -112,8 +142,8 @@ suite "Task level dependencies":
       verify execNimbleYes("develop", "unittest2@0.0.4")
       # # Add in a file to the develop file
       # # We will then try and import this
-      createDir "vendor/nim-unittest2/unittest2"
-      "vendor/nim-unittest2/unittest2/customFile.nim".writeFile("")
+      createDir "vendor/unittest2/unittest2"
+      "vendor/unittest2/unittest2/customFile.nim".writeFile("")
       let (output, exitCode) = execNimbleYes("-d:useDevelop", "test")
       check exitCode == QuitSuccess
       check "Using custom file" in output

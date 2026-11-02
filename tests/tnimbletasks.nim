@@ -1,4 +1,4 @@
-# Copyright (C) Dominik Picheta. All rights reserved.
+# Copyright (C) the Nimble contributors. All rights reserved.
 # BSD License. Look at license.txt for more info.
 
 {.used.}
@@ -32,3 +32,19 @@ suite "nimble tasks":
       let (output, exitCode) = execNimble("tasks")
       check output.contains("a         Description for a")
       check exitCode == QuitSuccess
+
+  test "successful task exits with code 0":
+    cd "tasks/exitcode":
+      let (output, exitCode) = execNimble("ok")
+      check output.contains("all good")
+      check exitCode == QuitSuccess
+
+  test "task exit code is propagated":
+    cd "tasks/exitcode":
+      let (_, exitCode) = execNimble("fail")
+      check exitCode == 3
+
+  test "failing exec in task produces non-zero exit code":
+    cd "tasks/exitcode":
+      let (_, exitCode) = execNimble("failexec")
+      check exitCode != QuitSuccess

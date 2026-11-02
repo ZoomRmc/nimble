@@ -1,16 +1,21 @@
 {.used.}
 import unittest, os
 import testscommon
-import std/[tables, sequtils, strutils, options, strformat]
+import std/[tables, sequtils, strutils, options, strformat, osproc, tempfiles]
 import chronos
-import nimblepkg/[version, nimblesat, options, config, download, packageinfotypes, versiondiscovery]
+import nimblepkg/[version, nimblesolver, options, config, download, packageinfotypes, versiondiscovery]
 from nimblepkg/common import cd, NimbleError
+from nimblepkg/packageparser import validateVersion
 
 let nimBin = some("nim")
 
 suite "Version Discovery":
   test "should be able to download a package and select its deps":
-
+    # Solves the latest release of a real package, so its dependencies have to
+    # be looked up in the live package list too. With no nimble dir of its own
+    # the test would read the snapshot checked in as `packages_official.json`,
+    # which misses every package published since (e.g. `intops`, required by
+    # stint 0.9.0).
     let pkgName: string = "nimlangserver"
     let pv: PkgTuple = (pkgName, VersionRange(kind: verAny))
     var options = initOptions()
@@ -19,6 +24,13 @@ suite "Version Discovery":
       "https://raw.githubusercontent.com/nim-lang/packages/master/packages.json",
       "https://nim-lang.org/nimble/packages.json"
     ])
+    let nimbleDir = installDir.parentDir / "versionDiscoveryNimbleDir"
+    removeDir(nimbleDir)
+    createDir(nimbleDir)
+    defer: removeDir(nimbleDir)
+    options.nimbleDir = nimbleDir
+    options.pkgCachePath = nimbleDir / "pkgcache"
+    waitFor refresh(options)
 
     var pkgInfo = downloadPkInfoForPv(pv, options, nimBin = nimBin)
     var root = pkgInfo.getMinimalInfo(options)
@@ -26,14 +38,12 @@ suite "Version Discovery":
     var pkgVersionTable = waitFor collectAllVersions(root, options, downloadMinimalPackage, nimBin = nimBin)
     pkgVersionTable[pkgName] = PackageVersions(pkgName: pkgName, versions: @[root])
 
-    var graph = pkgVersionTable.toDepGraph()
-    let form = graph.toFormular()
-    var packages = initTable[string, Version]()
+    # Resolved by the default solver, like any nimble command would.
     var output = ""
-    check solve(graph, form, packages, output, initOptions())
-    if packages.len == 0:
+    let solved = pkgVersionTable[].getSolvedPackages(output, options)
+    if solved.len == 0:
       echo output
-    check packages.len > 0
+    check solved.len > 0
 
   test "should be able to retrieve the package minimal info from the nimble directory":
     var options = initOptions()
@@ -44,6 +54,100 @@ suite "Version Discovery":
     check pkgVersionTable.hasVersion("b", newVersion "0.1.4")
     check pkgVersionTable.hasVersion("c", newVersion "0.1.0")
     check pkgVersionTable.hasVersion("c", newVersion "0.2.1")
+
+  test "duplicate special versions retain package identity and merge semantic metadata":
+    let nimRequirement = parseRequires("nim >= 1.6.0")
+    let installed = PackageMinimalInfo(
+      name: "nim",
+      version: newVersion("#head"),
+      requires: @[nimRequirement],
+      isRoot: true,
+      url: "local-install")
+    var discoveredVersion = newVersion("#head")
+    discoveredVersion.speSemanticVersion = some("2.2.8")
+    let discovered = PackageMinimalInfo(
+      name: "nim",
+      version: discoveredVersion,
+      url: "nimbinaries")
+
+    var pkgVersionTable = {
+      "nim": PackageVersions(pkgName: "nim", versions: @[installed])
+    }.toTable
+    pkgVersionTable.fillPackageTableFromPreferred(@[discovered])
+
+    check pkgVersionTable["nim"].versions.len == 1
+    let merged = pkgVersionTable["nim"].versions[0]
+    check merged.url == installed.url
+    check merged.requires == installed.requires
+    check merged.isRoot == installed.isRoot
+    check merged.version.speSemanticVersion == some("2.2.8")
+    check merged.version.satisfiesConstraint(parseVersionRange(">= 1.6.0"))
+
+  test "active feature requirements remain specific to each package version":
+    let oldFeatureReq = parseRequires("oldfeaturedep >= 1.0.0")
+    let newFeatureReq = parseRequires("newfeaturedep >= 2.0.0")
+
+    proc mockGetMinimalPackage(
+        pv: PkgTuple, options: Options,
+        nimBin: Option[string]
+    ): Future[seq[PackageMinimalInfo]] {.async.} =
+      case pv.name
+      of "featurepkg":
+        return @[
+          PackageMinimalInfo(
+            name: "featurepkg",
+            version: newVersion("1.0.0"),
+            features: {
+              "enabled": @[parseRequires("oldfeaturedep >= 1.0.0")]
+            }.toTable,
+          ),
+          PackageMinimalInfo(
+            name: "featurepkg",
+            version: newVersion("2.0.0"),
+            features: {
+              "enabled": @[parseRequires("newfeaturedep >= 2.0.0")]
+            }.toTable,
+          ),
+        ]
+      of "oldfeaturedep":
+        return @[
+          PackageMinimalInfo(
+            name: "oldfeaturedep", version: newVersion("1.0.0"))
+        ]
+      of "newfeaturedep":
+        return @[
+          PackageMinimalInfo(
+            name: "newfeaturedep", version: newVersion("2.0.0"))
+        ]
+      else:
+        return @[]
+
+    appendGloballyActiveFeatures("featurepkg", @["enabled"])
+    let root = PackageMinimalInfo(
+      name: "root",
+      version: newVersion("1.0.0"),
+      requires: @[parseRequires("featurepkg")],
+      isRoot: true,
+    )
+    let discovered = waitFor collectAllVersions(
+      root, initOptions(), mockGetMinimalPackage, nimBin = some("nim"))
+
+    check discovered.hasKey("featurepkg")
+    check discovered.hasKey("oldfeaturedep")
+    check discovered.hasKey("newfeaturedep")
+    if discovered.hasKey("featurepkg"):
+      let versions = discovered["featurepkg"].versions
+      check versions.len == 2
+      for pkg in versions:
+        case $pkg.version
+        of "1.0.0":
+          check oldFeatureReq in pkg.requires
+          check newFeatureReq notin pkg.requires
+        of "2.0.0":
+          check newFeatureReq in pkg.requires
+          check oldFeatureReq notin pkg.requires
+        else:
+          check false
 
   test "should fallback to the download if the package is not found in the list of packages":
     let root =
@@ -95,7 +199,7 @@ suite "Version Discovery":
     let downloadRes = pv.downloadPkgFromUrl(options, nimBin = nimBin)[0] #This is just to setup the test. We need a git dir to work on
     let repoDir = downloadRes.dir
     let downloadMethod = DownloadMethod git
-    let packageVersions = getPackageMinimalVersionsFromRepo(repoDir, pv, downloadRes.version, downloadMethod, options, nimBin = nimBin)
+    let packageVersions = waitFor getPackageMinimalVersionsFromRepo(repoDir, pv, downloadMethod, options, nimBin = nimBin)
 
     #we know these versions are available
     let availableVersions = @["0.3.4", "0.3.5", "0.3.6", "0.4.5", "0.4.4"].mapIt(newVersion(it))
@@ -122,7 +226,7 @@ suite "Version Discovery":
     let pvPrev = parseRequires("nimfp >= 0.3.4")
     let downloadResPrev = pvPrev.downloadPkgFromUrl(options, nimBin = nimBin)[0]
     let repoDirPrev = downloadResPrev.dir
-    discard getPackageMinimalVersionsFromRepo(repoDirPrev, pvPrev, downloadResPrev.version,  DownloadMethod.git, options, nimBin = nimBin)
+    discard waitFor getPackageMinimalVersionsFromRepo(repoDirPrev, pvPrev, DownloadMethod.git, options, nimBin = nimBin)
     # Check that the centralized cache file exists
     check fileExists(options.pkgCachePath / TaggedVersionsFileName)
 
@@ -132,7 +236,7 @@ suite "Version Discovery":
     let repoDir = downloadRes.dir
 
     # The second call should use the cached versions from the centralized cache
-    let packageVersions = getPackageMinimalVersionsFromRepo(repoDir, pv, downloadRes.version, DownloadMethod.git, options, nimBin = nimBin)
+    let packageVersions = waitFor getPackageMinimalVersionsFromRepo(repoDir, pv, DownloadMethod.git, options, nimBin = nimBin)
     #we know these versions are available
     let availableVersions = @["0.4.5", "0.4.4"].mapIt(newVersion(it))
     for version in availableVersions:
@@ -253,6 +357,49 @@ suite "Version Discovery":
     # Empty tag list — vacuously fresh.
     check cachedTagsCoverLocalTags(cached, @[])
 
+  test "downloadMinimalPackage memoizes a dep reached by many branches (75x ls-remote bug)":
+    # A near-universal transitive dep (e.g. unittest2 in nimbus-eth1) is reached by
+    # many top-level dependency branches, each with its own `visited` set. It must be
+    # downloaded ONCE per resolution pass. The bug: the cache evicted each entry the
+    # moment its download completed, so every branch that reached the dep *afterward*
+    # re-ran `git ls-remote` — 75 times in the wild. Remote tags don't change within a
+    # single invocation, so the result must be memoized for the whole pass.
+    var fetchCount = 0
+    proc countingFetch(pv: PkgTuple, options: Options, nimBin: Option[string]): Future[seq[PackageMinimalInfo]] {.async.} =
+      inc fetchCount
+      return @[PackageMinimalInfo(name: "diamonddep", version: newVersion("1.0.0"))]
+
+    let pv: PkgTuple = ("https://github.com/example/diamonddep.git", VersionRange(kind: verAny))
+    var options = initOptions()
+
+    # Branches reach the same dep one after another (staggered, not concurrent).
+    for i in 0 ..< 10:
+      let res = waitFor memoizedDownloadMinimal(pv, options, nimBin, countingFetch)
+      check res.len == 1
+
+    check fetchCount == 1
+
+  test "downloadMinimalPackage does not memoize a failed download":
+    # A failed discovery must be evicted so a later reach can retry (and so the real
+    # error surfaces) instead of replaying a cached failure for the rest of the pass.
+    var attempt = 0
+    proc flakyFetch(pv: PkgTuple, options: Options, nimBin: Option[string]): Future[seq[PackageMinimalInfo]] {.async.} =
+      inc attempt
+      if attempt == 1:
+        raise newException(NimbleError, "transient failure")
+      return @[PackageMinimalInfo(name: "flakydep", version: newVersion("2.0.0"))]
+
+    let pv: PkgTuple = ("https://github.com/example/flakydep.git", VersionRange(kind: verAny))
+    var options = initOptions()
+
+    expect CatchableError:
+      discard waitFor memoizedDownloadMinimal(pv, options, nimBin, flakyFetch)
+
+    # Second reach must retry, not replay the cached failure.
+    let res = waitFor memoizedDownloadMinimal(pv, options, nimBin, flakyFetch)
+    check res.len == 1
+    check attempt == 2
+
   test "verAny uses version-agnostic cache directory for discovery":
     # Test that verAny (used during package discovery) uses version-agnostic cache
     # to avoid downloading the same repo multiple times.
@@ -290,3 +437,225 @@ suite "Version Discovery":
 
     # Different special versions should have different directories
     check cacheDir4 != cacheDir5
+
+  test "getVersionList ignores tags that are not real version tags":
+    let tags = @[
+      "v1.0.0", "0.6.0", "v23.2.0-rc1", "v1.0.5",       # real version tags
+      "v7", "v20240112",                                 # single-segment versions (require a `v`)
+      "2024",                                            # single-segment WITHOUT `v` -> rejected
+      "201903-testnet0", "delete", "nightly", "latest", # junk
+      "not_a_release_0", "altona_v1", "altair-beta",    # junk
+    ]
+    let kept = toSeq(getVersionList(tags).values)
+    # real version tags are kept
+    check "v1.0.0" in kept
+    check "0.6.0" in kept
+    check "v23.2.0-rc1" in kept
+    check "v1.0.5" in kept
+    # single-segment versions are kept only with a `v` prefix
+    check "v7" in kept
+    check "v20240112" in kept
+    check "2024" notin kept
+    # junk tags are dropped (incl. junk that merely starts/ends with digits)
+    check "201903-testnet0" notin kept
+    check "delete" notin kept
+    check "nightly" notin kept
+    check "latest" notin kept
+    check "not_a_release_0" notin kept
+    check "altona_v1" notin kept
+    check "altair-beta" notin kept
+
+# --- Pre-release version discovery from real git tags -----------------------
+
+proc runGit(dir, args: string) =
+  let (output, code) = execCmdEx("git -C " & dir.quoteShell & " " & args)
+  doAssert code == 0, "git " & args & " failed:\n" & output
+
+proc nimbleContent(version: string, requires: seq[string] = @[]): string =
+  ## A minimal, declaratively-parseable nimble file.
+  result = "version = \"" & version & "\"\n" &
+           "author = \"t\"\ndescription = \"t\"\nlicense = \"MIT\"\n"
+  for r in requires:
+    result &= "requires \"" & r & "\"\n"
+
+proc makeTaggedRepo(remoteDir, pkgName: string,
+                    tags: seq[tuple[tag, content: string]]) =
+  ## Build a git repo where each tag points at a specific nimble file state.
+  removeDir(remoteDir)
+  createDir(remoteDir)
+  runGit(remoteDir, "init")
+  runGit(remoteDir, "config user.email test@test.com")
+  runGit(remoteDir, "config user.name test")
+  let nimbleFile = remoteDir / (pkgName & ".nimble")
+  for (tag, content) in tags:
+    writeFile(nimbleFile, content)
+    runGit(remoteDir, "add .")
+    runGit(remoteDir, "commit -m " & tag.quoteShell)
+    runGit(remoteDir, "tag " & tag)
+
+proc cloneLocalRepo(remoteDir, workDir: string) =
+  ## A local clone gets `origin` pointing at `remoteDir`, so the discovery
+  ## code's `git fetch --tags` works offline.
+  removeDir(workDir)
+  let (output, code) = execCmdEx(
+    "git clone " & remoteDir.quoteShell & " " & workDir.quoteShell)
+  doAssert code == 0, "git clone failed:\n" & output
+
+proc discoverVersions(workDir, reqStr, cacheDir: string): seq[PackageMinimalInfo] =
+  var options = initOptions()
+  options.nimBin = some options.makeNimBin("nim")
+  removeDir(cacheDir)
+  createDir(cacheDir)
+  options.pkgCachePath = cacheDir
+  let pv = parseRequires(reqStr)
+  result = waitFor getPackageMinimalVersionsFromRepo(
+    workDir, pv, DownloadMethod.git, options, nimBin = nimBin)
+
+suite "Cached HEAD version discovery":
+  test "a cached release must not hide a newer untagged checkout":
+    let base = createTempDir("nimble_head_discovery_", "")
+    defer: removeDir(base)
+    let remote = base / "remote"
+    let releaseWork = base / "release"
+    let headWork = base / "head"
+    let cache = base / "cache"
+
+    makeTaggedRepo(remote, "headlib", @[
+      ("v0.6.3", nimbleContent("0.6.3")),
+    ])
+    writeFile(remote / "headlib.nimble", nimbleContent("0.6.4"))
+    runGit(remote, "add .")
+    runGit(remote, "commit -m untagged")
+    cloneLocalRepo(remote, releaseWork)
+    runGit(releaseWork, "checkout v0.6.3")
+    cloneLocalRepo(remote, headWork)
+
+    # An earlier package discovers the latest release. A later requirement
+    # has no matching tag, so its download falls back to the untagged HEAD.
+    let released = discoverVersions(releaseWork, "headlib >= 0.6.3", cache)
+    check newVersion("0.6.4") notin released.mapIt(it.version)
+    let fresh = discoverVersions(headWork, "headlib >= 0.6.4", base / "fresh")
+    check newVersion("0.6.4") in fresh.mapIt(it.version)
+
+    var options = initOptions()
+    options.nimBin = some options.makeNimBin("nim")
+    options.pkgCachePath = cache
+    let req = parseRequires("headlib >= 0.6.4")
+    let cached = waitFor getPackageMinimalVersionsFromRepo(
+      headWork, req, DownloadMethod.git, options, nimBin)
+    check cached.mapIt(it.version) == fresh.mapIt(it.version)
+    check newVersion("0.6.4") in getTaggedVersions("headlib", options).get.mapIt(it.version)
+
+    # The discovered checkout must be usable by either dependency solver.
+    let root = PackageMinimalInfo(name: "root", version: newVersion("1.0.0"),
+      requires: @[req], isRoot: true)
+    let versions = {
+      "root": PackageVersions(pkgName: "root", versions: @[root]),
+      "headlib": PackageVersions(pkgName: "headlib", versions: cached),
+    }.toTable
+    for solver in [skSat, skPubGrub]:
+      options.solver = solver
+      var output = ""
+      let solved = versions.getSolvedPackages(output, options)
+      checkpoint output
+      check solved.anyIt(it.pkgName == "headlib" and it.version == newVersion("0.6.4"))
+
+suite "Pre-release version discovery (integration)":
+  let base = getTempDir() / "nimble_prerelease_it"
+
+  test "pre-release git tags are discovered and ordered below the final release":
+    let remote = base / "ordering_remote"
+    let work = base / "ordering_work"
+    let cache = base / "ordering_cache"
+    try:
+      makeTaggedRepo(remote, "prerelib", @[
+        ("v1.0.0-rc1", nimbleContent("1.0.0-rc1")),
+        ("v1.0.0", nimbleContent("1.0.0")),
+        ("v1.1.0", nimbleContent("1.1.0")),
+      ])
+      cloneLocalRepo(remote, work)
+      let vers = discoverVersions(work, "prerelib >= 1.0.0-rc1", cache).mapIt(it.version)
+      check newVersion("1.0.0-rc1") in vers
+      check newVersion("1.0.0") in vers
+      check newVersion("1.1.0") in vers
+      # the pre-release orders below its final release
+      check newVersion("1.0.0-rc1") < newVersion("1.0.0")
+    finally:
+      for d in [remote, work, cache]: removeDir(d)
+
+  test "a pre-release requires in a real nimble file is parsed end-to-end":
+    let remote = base / "requires_remote"
+    let work = base / "requires_work"
+    let cache = base / "requires_cache"
+    try:
+      makeTaggedRepo(remote, "reqlib", @[
+        ("v1.0.0", nimbleContent("1.0.0", @["dep >= 1.0.0-rc1"])),
+      ])
+      cloneLocalRepo(remote, work)
+      let versions = discoverVersions(work, "reqlib >= 1.0.0", cache)
+      let v = versions.filterIt(it.version == newVersion("1.0.0"))[0]
+      let depReq = v.requires.filterIt(it.name == "dep")[0]
+      check depReq.ver.kind == verEqLater
+      check depReq.ver.ver == newVersion("1.0.0-rc1")
+    finally:
+      for d in [remote, work, cache]: removeDir(d)
+
+  test "the package version field accepts a pre-release through the VM parser gate":
+    # validateVersion is the full/VM parser's gate on the `version` field. It
+    # must accept the same semver charset that newVersion and parseVersionRange
+    # accept, otherwise a package declaring `version = "1.0.0-rc1"` fails to
+    # parse whenever the VM fallback is used (complex/computed nimble files).
+    validateVersion("1.0.0-rc1")
+    validateVersion("2.0.0-alpha.1")
+    validateVersion("1.0.0+build.5")
+    # genuinely invalid characters are still rejected
+    expect NimbleError:
+      validateVersion("1.0.0/bad")
+
+  test "nimble file version field wins when it disagrees with the git tag":
+    # Tag says v2.0.0 but the nimble file declares 2.0.0-rc1. Discovery must use
+    # the nimble file version (declarativeparser: file version overrides the tag).
+    let remote = base / "mismatch_remote"
+    let work = base / "mismatch_work"
+    let cache = base / "mismatch_cache"
+    try:
+      makeTaggedRepo(remote, "mmlib", @[
+        ("v2.0.0", nimbleContent("2.0.0-rc1")),
+      ])
+      cloneLocalRepo(remote, work)
+      let vers = discoverVersions(work, "mmlib >= 1.0.0", cache).mapIt($it.version)
+      check "2.0.0-rc1" in vers   # file version wins
+      check "2.0.0" notin vers    # the tag's version is not used
+    finally:
+      for d in [remote, work, cache]: removeDir(d)
+
+suite "Special-version download memoization (#1785)":
+  # A special version (e.g. a pinned #<commit>) is downloaded on its own — it
+  # does NOT enumerate the repo's tags — and that download is what learns the
+  # commit's semantic version. A range/tag download of the same repo fetches
+  # tags but never that commit. So the two must NOT share a download-memoization
+  # cache entry: if a range download wins the shared entry first, the pinned
+  # commit is never fetched, its semantic version is never learned, and it can no
+  # longer satisfy a coexisting normal `>=` constraint. This made libp2p's
+  # `nimble install <url@#commit ...>` (install_pinned) fail nondeterministically.
+  test "a pinned special version and a range of the same repo get distinct cache keys":
+    var options = initOptions()
+    let url = "https://github.com/vacp2p/nim-boringssl"
+    let pinned: PkgTuple = (url, parseVersionRange("#e77caabae78fbc9aa5b78a0a521181b077c82571"))
+    let rangeReq: PkgTuple = (url, parseVersionRange(">= 0.0.8"))
+    # The pinned commit must not reuse the range download's result.
+    check computeDownloadCacheKey(pinned, options) !=
+          computeDownloadCacheKey(rangeReq, options)
+
+  test "two ranges of the same repo still share one download (dedup preserved)":
+    var options = initOptions()
+    let url = "https://github.com/vacp2p/nim-boringssl"
+    check computeDownloadCacheKey((url, parseVersionRange(">= 0.0.8")), options) ==
+          computeDownloadCacheKey((url, parseVersionRange(">= 0.0.4")), options)
+
+  test "the same pinned commit shares one download":
+    var options = initOptions()
+    let url = "https://github.com/vacp2p/nim-boringssl"
+    let a: PkgTuple = (url, parseVersionRange("#e77caabae78fbc9aa5b78a0a521181b077c82571"))
+    let b: PkgTuple = (url, parseVersionRange("#e77caabae78fbc9aa5b78a0a521181b077c82571"))
+    check computeDownloadCacheKey(a, options) == computeDownloadCacheKey(b, options)

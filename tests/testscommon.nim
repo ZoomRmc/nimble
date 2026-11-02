@@ -1,4 +1,4 @@
-# Copyright (C) Dominik Picheta. All rights reserved.
+# Copyright (C) the Nimble contributors. All rights reserved.
 # BSD License. Look at license.txt for more info.
 
 {.used.}
@@ -20,11 +20,33 @@ const
   pkgMultiAlphaUrl* = &"{pkgMultiUrl}?subdir=alpha"
   pkgMultiBetaUrl* = &"{pkgMultiUrl}?subdir=beta"
 
+proc testTempBase(): string {.used.} =  # unused on Windows (see testWorkDir below)
+  ## Base dir for the out-of-repo test work tree. On macOS getTempDir() yields a
+  ## /var/folders/… path, but /var is a symlink to /private/var and nimble
+  ## reports the resolved path — so canonicalize here, otherwise test path
+  ## comparisons against installDir would mismatch nimble's output.
+  result = getTempDir()
+  try: result = result.expandFilename
+  except CatchableError: discard
+
 let
   rootDir = getCurrentDir().parentDir
   nimblePath* = rootDir / "src" / addFileExt("nimble", ExeExt)
   nimbleCompilePath = rootDir / "src" / "nimble.nim"
-  installDir* = rootDir / "tests" / "nimbleDir"
+  testWorkDir =
+    when defined(windows):
+      # Windows MAX_PATH (260): a deep temp base plus packages with long nested
+      # paths (e.g. nim-libp2p → lsquic/boringssl testdata, ~150 chars on their
+      # own) overflow it. Keep the short in-repo location on Windows — the
+      # out-of-repo move is only about local-dev git hygiene on unix.
+      getEnv("NIMBLE_TEST_DIR", rootDir / "tests")
+    else:
+      getEnv("NIMBLE_TEST_DIR", testTempBase() / "nimble_test_dir")
+  installDir* = testWorkDir / "nimbleDir"
+  # Absolute path to the tests/ dir with the checked-in fixtures (package lists,
+  # develop fixtures, …). Tests that `cd` into installDir (now outside the repo)
+  # must reach fixtures through this, not via cwd-relative `../` paths.
+  testsDir* = rootDir / "tests"
   buildTests* = rootDir / "buildTests"
   pkgsDir* = installDir / nimblePackagesDirName
 
@@ -34,7 +56,12 @@ proc execNimble*(args: varargs[string]): ProcessOutput =
   quotedArgs.insert("--noColor")
   if not args.anyIt("--nimbleDir:" in it or "-l"  == it or "--local" == it):
     quotedArgs.insert("--nimbleDir:" & installDir)
-  if not args.anyIt("-l" == it or "--local" == it):
+  # `refresh` is the one action where -g/--global means something beyond "use
+  # the global nimble dir": it selects refreshing every globally known package
+  # over the current project's dependencies. Adding it here would rob those
+  # tests of the ability to exercise the project path, so they pass it (or not)
+  # themselves.
+  if not args.anyIt("-l" == it or "--local" == it or "refresh" == it):
     quotedArgs.insert("--global") #default to global mode for tests
   quotedArgs.insert(nimblePath)
   quotedArgs = quotedArgs.map((x: string) => x.quoteShell)
@@ -169,7 +196,10 @@ template usePackageListFile*(fileName: string, body: untyped) =
       name = "local"
       path = "$1"
     """.unindent % (fileName).replace("\\", "\\\\"))
-    check execNimble(["refresh"]).exitCode == QuitSuccess
+    # --packageListOnly: these fixtures only want the package list swapped in.
+    # A plain `refresh` inside a package also fetches its dependency clones,
+    # which needs the project to resolve — several fixtures deliberately don't.
+    check execNimble(["refresh", "--packageListOnly"]).exitCode == QuitSuccess
     body
 
 template cleanFile*(fileName: string) =

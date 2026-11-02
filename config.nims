@@ -3,13 +3,15 @@
 import std/os
 #The duplication of the paths (see src/nimble.nim.cfg) is necessary so nimble test keeps working
 switch("warning", "ObservableStores:off")
-switch("define", "ssl")
 switch("path", "vendor" / "zippy" / "src")
 switch("path", "vendor" / "sat" / "src")
 switch("path", "vendor" / "checksums" / "src")
 switch("path", "vendor" / "chronos")
 switch("path", "vendor" / "results")
 switch("path", "vendor" / "stew")
+switch("path", "vendor" / "httputils")
+switch("path", "vendor" / "bearssl")
+switch("path", "pubgrub" / "src")
 switch("define", "zippyNoSimd")
 # begin Nimble config (version 2)
 when withDir(thisDir(), system.fileExists("nimble.paths")):

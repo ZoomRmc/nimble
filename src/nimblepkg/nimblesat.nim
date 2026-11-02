@@ -1,11 +1,10 @@
 import sat/[sat, satvars]
-import version, packageinfotypes, packageinfo, options, tools, cli, common, urls
+import version, packageinfotypes, options, tools, cli
 import versiondiscovery
-import lockfile, declarativeparser, sha1hashes
+import nimblepubgrub
 
 import compat/[sequtils]
-import std/[tables, algorithm, sets, strutils, options, strformat, os]
-import chronos
+import std/[tables, algorithm, sets, strutils, options, strformat]
 
 type  
   SatVarInfo* = object # attached information for a SAT variable
@@ -51,9 +50,6 @@ type
 
 # var urlToName: Table[string, string] = initTable[string, string]()
 
-proc dumpPackageVersionTable*(pkg: PackageInfo, pkgVersionTable: Table[string, PackageVersions], options: Options, nimBin: Option[string])
-
-
 proc hasKey(packageToDependency: Table[string, int], dep: string): bool =
   for k in packageToDependency.keys:
     if cmpIgnoreCase(k, dep) == 0:
@@ -76,29 +72,30 @@ proc createRequirements(pkg: PackageMinimalInfo): Requirements =
   result.version = pkg.version
   result.nimVersion = pkg.requires.getNimVersion()
 
-proc cmp(a,b: DependencyVersion): int =
-  ## Compare dependency versions in ascending order (oldest first).
-  ## This ensures the SAT solver prefers newer versions because it tries
-  ## to set variables to FALSE first - by assigning variables to older
-  ## versions first (lower indices), the solver will try to set them false,
-  ## leaving newer versions (higher indices) more likely to be selected.
+proc cmp(a, b: DependencyVersion, algorithm: ResolutionAlgorithm): int =
+  ## Orders versions so the SAT solver's "try FALSE first" strategy lands on the
+  ## desired one. The solver assigns lower VarIds (earlier in this order) first
+  ## and tries them FALSE, so the LAST version in this order is the most
+  ## preferred. Special versions (#head, #branch, …) are always placed FIRST
+  ## (least preferred) so regular/tagged versions win, in both algorithms.
   ##
-  ## Special versions (#head, #branch, etc.) are always placed FIRST (as if they
-  ## were the "oldest"), so the SAT solver will try to set them FALSE first,
-  ## preferring tagged/regular versions over special versions.
+  ## - raMaxVer: regular versions ascending  -> newest is last  -> newest wins.
+  ## - raMinVer: regular versions descending -> oldest is last  -> oldest wins.
   let aIsSpecial = a.version.isSpecial
   let bIsSpecial = b.version.isSpecial
 
-  # Special versions come first (treated as oldest) so SAT solver prefers regular versions
+  # Special versions come first (treated as "least preferred") in both modes.
   if aIsSpecial and not bIsSpecial:
-    return -1  # a (special) comes before b (regular)
+    return -1
   elif bIsSpecial and not aIsSpecial:
-    return 1   # b (special) comes before a (regular), so a comes after
+    return 1
 
-  # Both special or both regular: use normal version comparison
-  if a.version < b.version: return -1
-  elif a.version == b.version: return 0
-  else: return 1
+  # Both special or both regular: normal comparison, reversed for raMinVer.
+  let c =
+    if a.version < b.version: -1
+    elif a.version == b.version: 0
+    else: 1
+  if algorithm == raMinVer: -c else: c
 
 proc getRequirementFromGraph(g: var DepGraph, pkg: PackageMinimalInfo): int =
   var temp = createRequirements(pkg)
@@ -137,15 +134,15 @@ proc toDepGraph*(versions: Table[string, PackageVersions]): DepGraph =
         # echo "ADDING URL: ", ver.url
         result.packageToDependency[ver.url] = i
 
-proc toFormular*(g: var DepGraph): Form =
+proc toFormular*(g: var DepGraph, algorithm = raMaxVer): Form =
   result = Form()
   var b = Builder()
   b.openOpr(AndForm)
-  
+
   # First pass: Assign variables and encode version selection constraints
   for p in mitems(g.nodes):
     if p.versions.len == 0: continue
-    p.versions.sort(cmp)
+    p.versions.sort(proc (x, y: DependencyVersion): int = cmp(x, y, algorithm))
     
     # Version selection constraint
     # Assign variables to all versions first (in ascending order, so older = lower VarId)
@@ -278,10 +275,12 @@ proc generateUnsatisfiableMessage(g: var DepGraph, f: Form, s: Solution): string
       for dep in req.deps:
         var dep = dep
         let depNodeIdx = findDependencyForDep(g, dep.name)
-        let depVersions = g.nodes[depNodeIdx].versions
-        let satisfiableVersions = 
+        let depVersions =
+          if depNodeIdx < 0: newSeq[DependencyVersion]()
+          else: g.nodes[depNodeIdx].versions
+        let satisfiableVersions =
           depVersions.filterIt(it.version.withinRange(dep.ver) and s.isTrue(it.v))
-        
+
         if satisfiableVersions.len == 0:
           # No version of this dependency could satisfy the requirement
           # Find which package/version had this requirement
@@ -295,32 +294,89 @@ proc generateUnsatisfiableMessage(g: var DepGraph, f: Form, s: Solution): string
   else:
     return "Dependency resolution failed due to the following conflicts:\n" & conflicts.join("\n")
 
-proc safeSatisfiable(f: Form, s: var Solution): bool =
-  try:
-    if satisfiable(f.f, s):
-      return true
-    else:
-      return false
-  except SatOverflowError:
-    return false
+type SatAttemptOutcome = enum
+  saoSat, saoUnsat, saoOverflow
 
-proc findMinimalFailingSet*(g: var DepGraph): tuple[failingSet: seq[PkgTuple], output: string] =
+proc attemptSatisfiable(f: Form; s: var Solution): SatAttemptOutcome =
+  ## Keeps "ran out of iterations" distinct from a
+  ## definitive "no solution exists": the two must not be conflated, because
+  ## the DPLL search giving up says nothing about the formula.
+  try:
+    if satisfiable(f.f, s): saoSat else: saoUnsat
+  except SatOverflowError:
+    saoOverflow
+
+const MaxSolveRotations = 24
+  ## How many alternative node orderings to try when the SAT search exceeds its
+  ## iteration budget. Each attempt is bounded by the solver's own budget
+  ## (~hundreds of ms), so this caps the extra work at a few seconds.
+
+proc rotatedGraph(g: DepGraph; shift: int): DepGraph =
+  ## Same graph, with the non-root nodes rotated by `shift`. The DPLL search
+  ## branches on variables in formula order, which follows node order, so a
+  ## rotation gives it a genuinely different search tree. Root stays at
+  ## index 0 — consumers rely on that.
+  result = DepGraph(reqs: g.reqs)
+  result.nodes.add g.nodes[0]
+  let n = g.nodes.len - 1
+  for i in 0 ..< n:
+    result.nodes.add g.nodes[1 + ((i + shift) mod n)]
+  for i in 0 ..< result.nodes.len:
+    result.packageToDependency[result.nodes[i].pkgName] = i
+    for ver in result.nodes[i].versions:
+      if ver.url != "":
+        result.packageToDependency[ver.url] = i
+
+proc decideSatisfiable(g0: DepGraph; algorithm: ResolutionAlgorithm;
+                       gUsed: var DepGraph; fUsed: var Form; s: var Solution;
+                       startShift = 0): SatAttemptOutcome =
+  ## Decides satisfiability, retrying under rotated node orders when the
+  ## search overflows its iteration budget: the DPLL search is extremely
+  ## sensitive to variable order, and real dependency graphs that overflow
+  ## under one order are typically solved in milliseconds under another
+  ## (found while chasing the nimlangserver tree, see
+  ## tests/packageMinimal/nimlangserver.json). Returns the first definitive
+  ## outcome, leaving the decisive graph/formula/solution in gUsed/fUsed/s;
+  ## saoOverflow means every attempted ordering ran out of budget.
+  result = saoOverflow
+  for shift in startShift .. min(g0.nodes.len - 1, MaxSolveRotations):
+    var g2 = if shift == 0: g0 else: rotatedGraph(g0, shift)
+    let f2 = toFormular(g2, algorithm)
+    var s2 = createSolution(f2.idgen)
+    let o = attemptSatisfiable(f2, s2)
+    if o == saoOverflow:
+      continue
+    gUsed = g2
+    fUsed = f2
+    s = s2
+    return o
+
+proc findMinimalFailingSet*(g: var DepGraph): tuple[failingSet, implicated: seq[PkgTuple], output: string] =
   var minimalFailingSet: seq[PkgTuple] = @[]
+  var implicated: seq[PkgTuple] = @[]
   let rootNode = g.nodes[0]
   let rootVersion = rootNode.versions[0]
   var allDeps = g.reqs[rootVersion.req].deps
-  
+
   # Try removing one dependency at a time to see if it makes it satisfiable
   for i in 0..<allDeps.len:
     var reducedDeps = allDeps
     reducedDeps.delete(i)
     var tempGraph = g
     tempGraph.reqs[rootVersion.req].deps = reducedDeps
-    let tempForm = toFormular(tempGraph)
-    var tempSolution = createSolution(tempForm.idgen)
-    if not safeSatisfiable(tempForm, tempSolution):
+    var gU: DepGraph
+    var fU: Form
+    var sU: Solution
+    case decideSatisfiable(tempGraph, raMaxVer, gU, fU, sU)
+    of saoSat:
+      # Removing this dependency resolves the conflict, so it is one of the
+      # actual participants — these are the packages worth pinning to an
+      # older version in the fallback retry (e.g. libp2p when a pinned quic
+      # commit is incompatible with the newest libp2p).
+      implicated.add(allDeps[i])
+    of saoUnsat, saoOverflow:
       minimalFailingSet.add(allDeps[i])
-  
+
   # Generate error message
   var output = ""
   if minimalFailingSet.len > 0:
@@ -354,41 +410,54 @@ proc findMinimalFailingSet*(g: var DepGraph): tuple[failingSet: seq[PkgTuple], o
                 output.add(&"\n\t -{req.name} {req.ver}")
                 shownReqs.incl(reqKey)
   
-  (minimalFailingSet, output)
+  (minimalFailingSet, implicated, output)
 
-proc solve*(g: var DepGraph; f: Form, packages: var Table[string, Version], output: var string, 
+proc solve*(g: var DepGraph; f: Form, packages: var Table[string, Version], output: var string,
            triedVersions: var seq[VersionAttempt], options: Options): bool {.instrument.} =
-  let m = f.idgen
-  var s = createSolution(m)
-  if safeSatisfiable(f, s):
-    # output.add analyzeVersionSelection(g, f, s)
+  var fUsed = f
+  var s = createSolution(fUsed.idgen)
+  var outcome = attemptSatisfiable(fUsed, s)
+  if outcome == saoOverflow:
+    # Retry under rotated node orders before concluding anything; adopt the
+    # ordering that produced a definitive answer (see decideSatisfiable).
+    outcome = decideSatisfiable(g, options.resolutionAlgorithm, g, fUsed, s,
+                                startShift = 1)
+  if outcome == saoSat:
+    # output.add analyzeVersionSelection(g, fUsed, s)
     for n in mitems g.nodes:
       if n.isRoot: n.active = true
-    for i in 0 ..< m:
-      if s.isTrue(VarId(i)) and f.mapping.hasKey(VarId i):
-        let m = f.mapping[VarId i]
+    for i in 0 ..< fUsed.idgen:
+      if s.isTrue(VarId(i)) and fUsed.mapping.hasKey(VarId i):
+        let m = fUsed.mapping[VarId i]
         let idx = findDependencyForDep(g, m.pkg)
         g.nodes[idx].active = true
         g.nodes[idx].activeVersion = m.index
 
     for n in items g.nodes:
       for v in items(n.versions):
-        let item = f.mapping[v.v]
+        let item = fUsed.mapping[v.v]
         if s.isTrue(v.v):
           packages[item.pkg] = item.version
-          output.add &"item.pkg  [x]  {toString item} \n"
+          output.add &"{item.pkg}  [x]  {toString item} \n"
         else:
-          output.add &"item.pkg  [ ]  {toString item} \n"
+          output.add &"{item.pkg}  [ ]  {toString item} \n"
     return true
-  else:    
-    output.add "\nFailed to find satisfiable solution (pass: {options.satResult.pass}):\n"
-    output.add analyzeVersionSelection(g, f, s)
-    let (failingSet, errorMsg) = findMinimalFailingSet(g)
-    if failingSet.len > 0:
+  else:
+    if outcome == saoOverflow:
+      output.add "\nThe dependency search exceeded its iteration budget on " &
+                 "every attempted ordering; the analysis below may be incomplete.\n"
+    output.add &"\nFailed to find satisfiable solution (pass: {options.satResult.pass}):\n"
+    output.add analyzeVersionSelection(g, fUsed, s)
+    let (failingSet, implicated, errorMsg) = findMinimalFailingSet(g)
+    # Pin the packages actually implicated in the conflict (removing them
+    # resolves it), falling back to the failing set when nothing is: pinning a
+    # package whose removal changes nothing cannot fix the solve.
+    let retryCandidates = if implicated.len > 0: implicated else: failingSet
+    if retryCandidates.len > 0:
       var newGraph = g
-      
+
       # Try each failing package
-      for pkg in failingSet:
+      for pkg in retryCandidates:
         let idx = findDependencyForDep(newGraph, pkg.name)
         if idx >= 0:
           let originalVersions = newGraph.nodes[idx].versions
@@ -399,7 +468,7 @@ proc solve*(g: var DepGraph; f: Form, packages: var Table[string, Version], outp
               triedVersions.add(attempt)
               # echo "Trying package ", pkg.name, " version ", ver.version
               newGraph.nodes[idx].versions = @[ver]  # Try just this version
-              let newForm = toFormular(newGraph)
+              let newForm = toFormular(newGraph, options.resolutionAlgorithm)
               if solve(newGraph, newForm, packages, output, triedVersions, options):
                 return true
           # Restore original versions if no solution found
@@ -409,7 +478,7 @@ proc solve*(g: var DepGraph; f: Form, packages: var Table[string, Version], outp
       output.add errorMsg
     else:
       output.add "\n\nFinal error message:\n"  # Add a separator
-      output.add generateUnsatisfiableMessage(g, f, s)
+      output.add generateUnsatisfiableMessage(g, fUsed, s)
     false
 
 
@@ -469,8 +538,50 @@ proc getReachablePackages(graph: DepGraph): HashSet[string] =
           if depLower in graphPackages:
             queue.add(graphPackages[depLower])  # Use graph's version of the name
 
-proc getSolvedPackages*(pkgVersionTable: Table[string, PackageVersions], output: var string, options: Options): seq[SolvedPackage] {.instrument.} =
-  var graph = pkgVersionTable.toDepGraph()
+const solverDisagreementNote =
+  "\nNote: the dependency graph appears solvable (PubGrub found a solution " &
+  "where the SAT solver did not). This is a solver bug - please report it at " &
+  "https://github.com/nim-lang/nimble/issues\n"
+
+proc toSolvedPackages*(graph: DepGraph, packages: Table[string, Version]): seq[SolvedPackage] =
+  ## The chosen version of every package, with what it requires and what
+  ## requires it - the shape installation and lock files read, whichever
+  ## solver made the choice.
+  for pkg, ver in packages:
+    let nodeIdx = graph.packageToDependency.getKey(pkg)
+    for dep in graph.nodes[nodeIdx].versions:
+      if dep.version == ver:
+        let reqIdx = dep.req
+        let deps =  graph.reqs[reqIdx].deps
+        let solvedPkg = SolvedPackage(pkgName: pkg, version: ver, 
+          requirements: deps, 
+          reverseDependencies: collectReverseDependencies(pkg, graph),
+        )
+        result.add solvedPkg
+  
+  # Create lookup table for O(1) package access
+  var pkgLookup = initTable[string, SolvedPackage]()
+  for pkg in result:
+    pkgLookup[pkg.pkgName] = pkg
+
+  # Collect the deps for every solved package
+  for solvedPkg in result.mitems:
+    for (depName, depVer) in solvedPkg.requirements:
+      if pkgLookup.hasKey(depName):
+        let otherPkg = pkgLookup[depName]
+        if otherPkg.version.withinRange(depVer):
+          solvedPkg.deps.add(otherPkg)
+  # Collect reverse deps as solved package
+  for solvedPkg in result.mitems:
+    for (depName, depVer) in solvedPkg.reverseDependencies:
+      if pkgLookup.hasKey(depName):
+        solvedPkg.reverseDeps.add(pkgLookup[depName])
+
+proc satPackages*(graph: var DepGraph, pkgVersionTable: Table[string, PackageVersions],
+                  output: var string, options: Options): Table[string, Version] =
+  ## `--solver:sat`: the version chosen for each package in `graph` (built
+  ## from `pkgVersionTable`), or none, with the reason in `output`. When SAT
+  ## finds no solution, PubGrub re-solves the table to explain why.
 
   # Only validate packages reachable from root, not ALL packages in the table.
   # Pre-loaded cached packages may have deps not relevant to this resolution;
@@ -512,859 +623,43 @@ proc getSolvedPackages*(pkgVersionTable: Table[string, PackageVersions], output:
       if not allMissingAreOptional:
         break
     if not allMissingAreOptional:
-      output.add "Missing dependencies: " & missingDeps.join(", ") & "\n"
-      for k, v in pkgVersionTable:
-        output.add &"Package {k} \n"
-        for v in v.versions:
-          output.add &"\t \t Version {v.version} requires: {v.requires} \n"
-      if options.satResult.gitErrors.len > 0:
-        output.add "The following errors occurred during package discovery (could be network issues):\n"
-        for err in options.satResult.gitErrors:
-          output.add &"  - {err}\n"
-      return newSeq[SolvedPackage]()
+      # A package nothing can provide is a resolution failure like any other,
+      # so explain it the same way instead of dumping the whole universe: the
+      # table only helps when debugging the resolver itself (--verbose).
+      let (foundSolution, explanation) = explainSolveFailure(pkgVersionTable)
+      if explanation.len > 0 and options.verbosity > LowPriority:
+        output = "Dependency resolution failed:\n" & explanation & "\n"
+      else:
+        output.add "Missing dependencies: " & missingDeps.join(", ") & "\n"
+        for k, v in pkgVersionTable:
+          output.add &"Package {k} \n"
+          for v in v.versions:
+            output.add &"\t \t Version {v.version} requires: {v.requires} \n"
+        if explanation.len > 0:
+          output.add "\n" & explanation & "\n"
+        elif foundSolution:
+          # The missing-dependency heuristic above scans every node, reachable
+          # or not, so it can declare fatal what the solver would route around.
+          output.add solverDisagreementNote
+      output.addDiscoveryErrors(options)
+      return
     
-  let form = toFormular(graph)
+  let form = toFormular(graph, options.resolutionAlgorithm)
   var packages = initTable[string, Version]()
   var triedVersions: seq[VersionAttempt] = @[]
-  discard solve(graph, form, packages, output, triedVersions, options)
-
-  for pkg, ver in packages:
-    let nodeIdx = graph.packageToDependency.getKey(pkg)
-    for dep in graph.nodes[nodeIdx].versions:
-      if dep.version == ver:
-        let reqIdx = dep.req
-        let deps =  graph.reqs[reqIdx].deps
-        let solvedPkg = SolvedPackage(pkgName: pkg, version: ver, 
-          requirements: deps, 
-          reverseDependencies: collectReverseDependencies(pkg, graph),
-        )
-        result.add solvedPkg
-  
-  # Create lookup table for O(1) package access
-  var pkgLookup = initTable[string, SolvedPackage]()
-  for pkg in result:
-    pkgLookup[pkg.pkgName] = pkg
-
-  # Collect the deps for every solved package
-  for solvedPkg in result.mitems:
-    for (depName, depVer) in solvedPkg.requirements:
-      if pkgLookup.hasKey(depName):
-        let otherPkg = pkgLookup[depName]
-        if otherPkg.version.withinRange(depVer):
-          solvedPkg.deps.add(otherPkg)
-  # Collect reverse deps as solved package
-  for solvedPkg in result.mitems:
-    for (depName, depVer) in solvedPkg.reverseDependencies:
-      if pkgLookup.hasKey(depName):
-        solvedPkg.reverseDeps.add(pkgLookup[depName])
-
-proc topologicalSort*(solvedPkgs: seq[SolvedPackage]): seq[SolvedPackage] {.instrument.}  =
-  var inDegree = initTable[string, int]()
-  var adjList = initTable[string, seq[string]]()
-  var zeroInDegree: seq[string] = @[]
-  # Create a lookup table for O(1) package access
-  var pkgLookup = initTable[string, SolvedPackage]()
-
-  # Initialize in-degree and adjacency list using requirements
-  for pkg in solvedPkgs:
-    let pkgNameLower = pkg.pkgName.toLowerAscii
-    pkgLookup[pkgNameLower] = pkg
-    if not inDegree.hasKey(pkgNameLower):
-      inDegree[pkgNameLower] = 0  # Ensure every package is in the inDegree table
-    for dep in pkg.requirements:
-      let depNameLower = dep.name.toLowerAscii
-      if depNameLower notin adjList:
-        adjList[depNameLower] = @[pkgNameLower]
+  if not solve(graph, form, packages, output, triedVersions, options):
+    # SAT found no solution. PubGrub re-solves the same universe to produce
+    # an explanation of *why* - and if it finds a solution instead, one of
+    # the two solvers is wrong, which is worth surfacing loudly.
+    let (foundSolution, explanation) = explainSolveFailure(pkgVersionTable)
+    if explanation.len > 0:
+      if options.verbosity <= LowPriority:
+        # --verbose/--debug: keep the SAT solver's full search dump above.
+        output.add "\n" & explanation & "\n"
       else:
-        adjList[depNameLower].add(pkgNameLower)
-      inDegree[pkgNameLower].inc  # Increase in-degree of this pkg since it depends on dep
+        # The explanation is the user-facing error; the search dump is noise.
+        output = "Dependency resolution failed:\n" & explanation & "\n"
+    elif foundSolution:
+      output.add solverDisagreementNote
 
-  # Find all nodes with zero in-degree
-  for (pkgName, degree) in inDegree.pairs:
-    if degree == 0:
-      zeroInDegree.add(pkgName)
-
-  # Perform the topological sorting
-  while zeroInDegree.len > 0:
-    let current = zeroInDegree.pop()
-    let currentPkg = pkgLookup[current]
-    result.add(currentPkg)
-    for neighbor in adjList.getOrDefault(current, @[]):
-      inDegree[neighbor] -= 1
-      if inDegree[neighbor] == 0:
-        zeroInDegree.add(neighbor) 
-
-proc isSystemNimCompatible*(solvedPkgs: seq[SolvedPackage], options: Options, nimVersion: Option[Version]): bool =
-  if options.action.typ in {actionLock, actionDeps} or options.hasNimInLockFile():
-    return false
-  for solvedPkg in solvedPkgs:
-    for req in solvedPkg.requirements:
-      if req.isNim and nimVersion.isSome and not nimVersion.get.withinRange(req.ver):
-        return false
-  true
-
-proc areAllReqAny(dep: SolvedPackage): bool =
-  #Checks where all the requirements by other packages in the solution are any
-  #This allows for using a special version to meet the requirement of the solution
-  #Scenario will be, int he package list there is only a special version but all requirements
-  #are any. So it wont need to download a regular version but just use the special version.
-  for rev in dep.reverseDeps:
-    for req in rev.requirements:
-      if dep.pkgName == req.name:
-        if req.ver.kind != verAny:
-          return false
-  true
-
-proc normalizeGitUrl*(url: string): string =
-  ## Normalize a git URL for comparison: strip trailing ".git" and "/", lowercase.
-  ## e.g. "https://github.com/user/repo.git" == "https://github.com/user/repo"
-  result = url.strip(chars = {'/'})
-  if result.endsWith(".git"):
-    result = result[0..^5]
-  result = result.toLowerAscii()
-
-proc getPackageNameFromUrl*(pv: PkgTuple, pkgVersionTable: Table[string, PackageVersions], options: Options): string =
-  let normalizedPvName = normalizeGitUrl(pv.name)
-  var candidates: seq[string] = @[]
-  for pkgName, pkgVersions in pkgVersionTable:
-    for pkgVersion in pkgVersions.versions:
-      if normalizeGitUrl(pkgVersion.url) == normalizedPvName:
-        candidates.add(pkgName)
-
-  # Prefer package names that are not URLs
-  for candidate in candidates:
-    if not candidate.isUrl:
-      return candidate
-
-  # If no non-URL candidate, return the first one
-  if candidates.len > 0:
-    return candidates[0]
-
-proc getUrlFromPkgName*(pkgName: string, pkgVersionTable: Table[string, PackageVersions], options: Options): string =
-  for pkgTableName, pkgVersions in pkgVersionTable:
-    for pkgVersion in pkgVersions.versions:
-      if pkgVersion.name.toLower == pkgName.toLower:
-        return pkgVersion.url
-  return ""
-
-proc normalizeRequirements*(pkgVersionTable: var Table[string, PackageVersions], options: Options) {.instrument.} =
-  for pkgName, pkgVersions in pkgVersionTable.mpairs:
-    for pkgVersion in pkgVersions.versions.mitems:
-      for req in pkgVersion.requires.mitems:
-        if req.name.isUrl:
-          let newPkgName = getPackageNameFromUrl(req, pkgVersionTable, options)
-          if newPkgName != "":
-            let oldReq = req.name
-            req.name = newPkgName
-            options.satResult.normalizedRequirements[newPkgName] = oldReq
-        req.name = req.name.resolveAlias(options)
-
-proc normalizeSpecialVersions*(pkgVersionTable: var Table[string, PackageVersions], options: Options) {.instrument.} =
-  ## First-#-wins: when multiple special versions exist for the same package
-  ## (e.g. asynctools#commit_a from jester, asynctools#commit_b from httpbeast),
-  ## keep only the first one encountered (topologically closest to root, since
-  ## processRequirements traverses depth-first from root). Rewrite all other
-  ## special requirements for that package to use the winner.
-  var winners = initTable[string, Version]()  # pkgName -> winning special version
-
-  # Phase 1: find packages with multiple special versions, pick the first one
-  for pkgName, pkgVersions in pkgVersionTable.mpairs:
-    if pkgName.isNim:
-      continue
-    var specialVersions: seq[Version] = @[]
-    for v in pkgVersions.versions:
-      if v.version.isSpecial:
-        specialVersions.add v.version
-    if specialVersions.len > 1:
-      let winner = specialVersions[0]  # first = topologically first (DFS order)
-      let others = specialVersions[1..^1].mapIt($it).join(", ")
-      if not options.lenient:
-        raise newNimbleError[NimbleError](
-          &"Multiple dependencies require different special versions of '{pkgName}': " &
-          &"{specialVersions[0]}, {others}.")
-      winners[pkgName] = winner
-      pkgVersions.versions = pkgVersions.versions.filterIt(
-        not it.version.isSpecial or it.version == winner
-      )
-      displayWarning(&"Multiple dependencies require different special versions of '{pkgName}': " &
-        &"using {winner}, ignoring {others}. This will become an error in future versions.", HighPriority)
-
-  # Phase 2: remove URL-keyed table entries for packages that have a winner
-  # and fix normalizedRequirements so it points to the correct URL
-  if winners.len > 0:
-    var keysToRemove: seq[string] = @[]
-    var winnerUrls = initTable[string, string]()  # pkgName -> URL of fork that has the winning version
-    for key, pkgVersions in pkgVersionTable:
-      if key.isUrl and pkgVersions.versions.len > 0:
-        let name = pkgVersions.versions[0].name.toLower
-        if name in winners:
-          for v in pkgVersions.versions:
-            if v.version == winners[name]:
-              winnerUrls[name] = key
-              break
-          keysToRemove.add key
-    for key in keysToRemove:
-      pkgVersionTable.del key
-    # Update normalizedRequirements: point to the winning fork's URL,
-    # or remove the entry if the winner came from a name-based requirement
-    # (so normal package resolution finds the official URL from packages.json)
-    for name, winner in winners:
-      if name in winnerUrls:
-        options.satResult.normalizedRequirements[name] = winnerUrls[name]
-      elif name in options.satResult.normalizedRequirements:
-        options.satResult.normalizedRequirements.del name
-
-    # Phase 3: rewrite requirements across the table to use winning versions
-    for pkgName, pkgVersions in pkgVersionTable.mpairs:
-      for pkgVersion in pkgVersions.versions.mitems:
-        for req in pkgVersion.requires.mitems:
-          let reqName = req.name.toLower
-          if reqName in winners and req.ver.kind == verSpecial and req.ver.spe != winners[reqName]:
-            req.ver = VersionRange(kind: verSpecial, spe: winners[reqName])
-proc postProcessSolvedPkgs*(solvedPkgs: var seq[SolvedPackage], options: Options, nimBin: Option[string]) {.instrument.} =
-  #Prioritizes fileUrl packages over the regular packages defined in the requirements
-  var fileUrlPkgs: seq[PackageInfo] = @[]
-  for solved in solvedPkgs:
-    if solved.pkgName.isFileURL:
-      let pkg = getPackageFromFileUrl(solved.pkgName, options, nimBin)
-      fileUrlPkgs.add pkg
-  var toReplace: seq[SolvedPackage] = @[]
-  for solved in solvedPkgs:
-    for fileUrlPkg in fileUrlPkgs:
-      if solved.pkgName == fileUrlPkg.basicInfo.name:
-        toReplace.add solved
-        break
-  solvedPkgs = solvedPkgs.filterIt(it notin toReplace)
-
-proc buildCompatTable*(satResult: SATResult, solvedPkgs: seq[SolvedPackage],
-    freshSolvedPkgs: seq[SolvedPackage], pkgListDecl: seq[PackageInfo],
-    options: Options): Table[string, PackageVersions] =
-  ## Build a pkgVersionTable with one version per package for compatibility
-  ## checking. Uses real requires from pkgListDecl for locked packages and
-  ## from freshSolvedPkgs for upgraded/new packages.
-  var freshLookup = initTable[string, SolvedPackage]()
-  for sp in freshSolvedPkgs:
-    freshLookup[sp.pkgName.toLowerAscii()] = sp
-
-  var rootMinimal = satResult.rootPackage.getMinimalInfo(options)
-  rootMinimal.isRoot = true
-  result[rootMinimal.name] = PackageVersions(pkgName: rootMinimal.name, versions: @[rootMinimal])
-
-  # Add nim so that `requires "nim >= X"` constraints can be validated
-  let nimVersion = satResult.nimResolved.version
-  if nimVersion != notSetVersion:
-    let nimMinimal = PackageMinimalInfo(name: "nim", version: nimVersion)
-    result["nim"] = PackageVersions(pkgName: "nim", versions: @[nimMinimal])
-
-  for solvedPkg in solvedPkgs:
-    if solvedPkg.pkgName == satResult.rootPackage.basicInfo.name: continue
-    if solvedPkg.pkgName.isNim: continue
-    let key = solvedPkg.pkgName.toLowerAscii()
-    # For upgraded/new packages, use requirements from the fresh SAT solve
-    if key in freshLookup:
-      let tempPkg = freshLookup[key]
-      let minimal = PackageMinimalInfo(
-        name: solvedPkg.pkgName, version: tempPkg.version,
-        requires: tempPkg.requirements)
-      result[solvedPkg.pkgName] = PackageVersions(
-        pkgName: solvedPkg.pkgName, versions: @[minimal])
-      continue
-    # For locked packages, get real requires from installed packages
-    var found = false
-    for pkg in pkgListDecl:
-      if cmpIgnoreCase(pkg.basicInfo.name, solvedPkg.pkgName) == 0 and
-        pkg.basicInfo.version == solvedPkg.version:
-        result[solvedPkg.pkgName] = PackageVersions(
-          pkgName: solvedPkg.pkgName, versions: @[pkg.getMinimalInfo(options)])
-        found = true
-        break
-    if not found:
-      let minimal = PackageMinimalInfo(
-        name: solvedPkg.pkgName, version: solvedPkg.version,
-        requires: solvedPkg.requirements)
-      result[solvedPkg.pkgName] = PackageVersions(
-        pkgName: solvedPkg.pkgName, versions: @[minimal])
-
-proc validateUpgradeCompat*(satResult: SATResult, solvedPkgs: seq[SolvedPackage],
-    freshSolvedPkgs: seq[SolvedPackage], pkgListDecl: seq[PackageInfo],
-    options: Options) =
-  ## Verify that the upgraded packages are compatible with the locked deps.
-  ## Raises NimbleError if the combination is unsatisfiable.
-  let compatTable = buildCompatTable(satResult, solvedPkgs, freshSolvedPkgs, pkgListDecl, options)
-  var output = ""
-  let solved = compatTable.getSolvedPackages(output, options)
-  if solved.len == 0:
-    raise newNimbleError[NimbleError](
-      "Upgrade is incompatible with locked dependencies:\n" & output)
-
-proc solveLocalPackages(root: PackageMinimalInfo, pkgList: seq[PackageInfo], options: Options, output: var string, solvedPkgs: var seq[SolvedPackage], nimBin: Option[string]): HashSet[PackageInfo] =
-  ## Try to solve using only installed packages (no cache, no downloads).
-  ## Returns the solved packages if successful, or an empty set if local
-  ## packages don't satisfy all constraints. See #1648.
-  var localTable = initTable[string, PackageVersions]()
-  localTable[root.name] = PackageVersions(pkgName: root.name, versions: @[root])
-  localTable.fillPackageTableFromPreferred(pkgList.mapIt(it.getMinimalInfo(options)))
-  var localOutput = ""
-  let localSolved = localTable.getSolvedPackages(localOutput, options)
-  if localSolved.len == 0:
-    return  # Local solve failed, caller should fall back to full resolution
-  localTable.normalizeRequirements(options)
-  localTable.normalizeSpecialVersions(options)
-  options.satResult.pkgVersionTable = localTable
-  solvedPkgs = localTable.getSolvedPackages(output, options).topologicalSort()
-  solvedPkgs.postProcessSolvedPkgs(options, nimBin)
-  var pkgs: HashSet[PackageInfo]
-  for solvedPkg in solvedPkgs:
-    if solvedPkg.pkgName == root.name: continue
-    for pkgInfo in pkgList:
-      if (cmpIgnoreCase(pkgInfo.basicInfo.name, solvedPkg.pkgName) == 0 or cmpIgnoreCase(pkgInfo.metadata.url, solvedPkg.pkgName) == 0) and
-        pkgInfo.basicInfo.version == solvedPkg.version:
-        pkgs.incl pkgInfo
-        break
-  return pkgs
-
-proc solvePackages*(rootPkg: PackageInfo, pkgList: seq[PackageInfo], pkgsToInstall: var seq[(string, Version)], options: Options, output: var string, solvedPkgs: var seq[SolvedPackage], nimBin: Option[string]): HashSet[PackageInfo] {.instrument.} =
-  var root: PackageMinimalInfo = rootPkg.getMinimalInfo(options)
-  root.isRoot = true
-
-  # Try local solve first: if installed packages satisfy all constraints,
-  # use them without fetching newer versions. Skip for upgrade/lock which
-  # explicitly want fresh resolution.
-  if pkgList.len > 0 and options.action.typ notin {actionUpgrade, actionLock}:
-    let localResult = solveLocalPackages(root, pkgList, options, output, solvedPkgs, nimBin)
-    if localResult.len > 0 or solvedPkgs.len > 0:
-      return localResult
-
-  var pkgVersionTable: Table[system.string, packageinfotypes.PackageVersions]
-  # Load cached package versions to skip re-fetching known packages
-  pkgVersionTable = cacheToPackageVersionTable(options)
-  pkgVersionTable[root.name] = PackageVersions(pkgName: root.name, versions: @[root])
-
-  let discoveredVersions = waitFor collectAllVersions(root, options, downloadMinimalPackage, pkgList.mapIt(it.getMinimalInfo(options)), nimBin)
-  for pkgName, pkgVersions in discoveredVersions:
-    if pkgName notin pkgVersionTable:
-      pkgVersionTable[pkgName] = pkgVersions
-    else:
-      for ver in pkgVersions.versions:
-        pkgVersionTable[pkgName].versions.addVersionUnique ver
-
-  pkgVersionTable.normalizeRequirements(options)
-  pkgVersionTable.normalizeSpecialVersions(options)
-
-  options.satResult.pkgVersionTable = pkgVersionTable
-  solvedPkgs = pkgVersionTable.getSolvedPackages(output, options).topologicalSort()
-  solvedPkgs.postProcessSolvedPkgs(options, nimBin)
-  
-  let systemNimCompatible = solvedPkgs.isSystemNimCompatible(options, getNimVersionFromBin(nimBin.getNimBin))
-  # echo "DEBUG: SolvedPkgs after post processing: ", solvedPkgs.mapIt(it.pkgName & " " & $it.version).join(", ")
-  # echo "ACTION IS ", options.action.typ
-  for solvedPkg in solvedPkgs:
-    if solvedPkg.pkgName == root.name: continue    
-    var foundInList = false
-    let canUseAny = solvedPkg.areAllReqAny()
-    for pkgInfo in pkgList:
-      let specialVersions = if pkgInfo.metadata.specialVersions.len > 1: pkgInfo.metadata.specialVersions.toSeq()[1..^1] else: @[]
-      let isSpecial = specialVersions.len > 0
-      if (cmpIgnoreCase(pkgInfo.basicInfo.name, solvedPkg.pkgName) == 0 or cmpIgnoreCase(pkgInfo.metadata.url, solvedPkg.pkgName) == 0) and 
-        (pkgInfo.basicInfo.version == solvedPkg.version and (not isSpecial or canUseAny) or solvedPkg.version in specialVersions) and
-        #only add one (we could fall into adding two if there are multiple special versiosn in the package list and we can add any). 
-        #But we still allow it on upgrade as they are post proccessed in a later stage
-          ((options.action.typ in {actionLock}) or #For lock the result is cleaned in the lock proc that handles the pass
-            (result.toSeq.filterIt(cmpIgnoreCase(it.basicInfo.name, solvedPkg.pkgName) == 0 or 
-            cmpIgnoreCase(it.metadata.url, solvedPkg.pkgName) == 0).len == 0 or 
-            options.action.typ in {actionUpgrade})): 
-          result.incl pkgInfo
-          foundInList = true
-    if not foundInList:
-      # displayInfo(&"Coudlnt find {solvedPkg.pkgName}", priority = HighPriority)
-      if solvedPkg.pkgName.isNim and systemNimCompatible:
-        continue #Skips systemNim
-      pkgsToInstall.addUnique((solvedPkg.pkgName, solvedPkg.version))
-      
-    # echo "Packages in result: ", result.mapIt(it.basicInfo.name & " " & $it.basicInfo.version & " " & $it.metaData.vcsRevision).join(", ")
-
-
-proc getPackageInfo*(name: string, pkgs: seq[PackageInfo], version: Option[Version] = none(Version)): Option[PackageInfo] =
-    for pkg in pkgs:
-      if cmpIgnoreCase(pkg.basicInfo.name, name) == 0 or cmpIgnoreCase(pkg.metadata.url, name) == 0:
-        if version.isSome:
-          if pkg.basicInfo.version == version.get:
-            return some pkg
-        else: #No version passed over first match
-          return some pkg
-
-proc getPkgVersionTable*(pkgInfo: PackageInfo, pkgList: seq[PackageInfo], options: Options, nimBin: Option[string]): Table[string, PackageVersions] =
-  # Load cached package versions to skip re-fetching known packages
-  result = cacheToPackageVersionTable(options)
-  var root = pkgInfo.getMinimalInfo(options)
-  root.isRoot = true
-  result[root.name] = PackageVersions(pkgName: root.name, versions: @[root])
-  let discoveredVersions = waitFor collectAllVersions(root, options, downloadMinimalPackage, pkgList.mapIt(it.getMinimalInfo(options)), nimBin)
-  for pkgName, pkgVersions in discoveredVersions:
-    if not result.hasKey(pkgName):
-      result[pkgName] = pkgVersions
-    else:
-      for ver in pkgVersions.versions:
-        result[pkgName].versions.addVersionUnique ver
-
-
-const maxPkgNameDisplayWidth = 40  # Cap package name width
-const maxVersionDisplayWidth = 10  # Cap version width
-
-proc formatPkgName(pkgName: string, maxWidth = maxPkgNameDisplayWidth): string =
-  result = pkgName
-  if result.startsWith("https:"):
-    let parts = result.split('/')
-    result = parts[^1]
-  # Handle git repo names with extension
-  if result.endsWith(".git"):
-    result = result[0..^5]  # Remove .git suffix
-  
-  # Truncate if still too long
-  if result.len > maxWidth - 3:
-    result = result[0..<(maxWidth - 3)] & "..."
-
-proc dumpSolvedPackages*(pkgInfo: PackageInfo, pkgList: seq[PackageInfo], options: Options, nimBin: Option[string]) =
-  var pkgToInstall: seq[(string, Version)] = @[]
-  var output = ""
-  var solvedPkgs: seq[SolvedPackage] = @[]
-  discard solvePackages(pkgInfo, pkgList, pkgToInstall, options, output, solvedPkgs, nimBin)
-
-  echo "PACKAGE".alignLeft(maxPkgNameDisplayWidth), "VERSION".alignLeft(maxVersionDisplayWidth), "REQUIREMENTS"
-  echo "-".repeat(maxPkgNameDisplayWidth + maxVersionDisplayWidth + 4)
-  
-  # Sort packages alphabetically
-  var sortedPackages = solvedPkgs
-  sortedPackages.sort(proc(a, b: SolvedPackage): int =
-    result = cmp(a.pkgName, b.pkgName)
-    if result == 0:
-      result = cmp(a.version, b.version)
-  )
-  
-  # Find the pkgInfo package in the solved packages and move it to the front
-  for i, pkg in sortedPackages:
-    if pkg.pkgName == pkgInfo.basicInfo.name:
-      let rootPkg = sortedPackages[i]
-      sortedPackages.delete(i)
-      sortedPackages.insert(rootPkg, 0)
-      break
-  
-  # Display each package
-  for i, pkg in sortedPackages:
-    var displayName = formatPkgName(pkg.pkgName)
-    
-    # Mark root package with an asterisk (either it's the first package after sorting, or it's pkgInfo)
-    let rootMarker = if pkg.pkgName == pkgInfo.basicInfo.name: "*" else: " "
-    
-    # Format requirements
-    var reqStr = ""
-    for i, req in pkg.requirements:
-      if i > 0: reqStr.add ", "
-      
-      var reqName = formatPkgName(req.name)
-      reqStr.add reqName
-      if req.ver.kind != verAny:
-        reqStr.add " " & $req.ver
-    
-    # Display package line
-    echo rootMarker, " ", 
-         displayName.alignLeft(maxPkgNameDisplayWidth - 1), 
-         $pkg.version.version.alignLeft(maxVersionDisplayWidth), 
-         if reqStr.len > 0: reqStr.splitLines()[0] else: ""
-    
-    # If requirements were long, display them on additional indented lines
-    if reqStr.len > 0 and (reqStr.contains('\n') or reqStr.len > 80):
-      let lines = reqStr.split(", ")
-      var currentLine = ""
-      for i, req in lines:
-        if currentLine.len + req.len + 2 > 80:  # +2 for ", "
-          if currentLine.len > 0:
-            echo " ".repeat(maxPkgNameDisplayWidth + maxVersionDisplayWidth + 3), currentLine
-          currentLine = req
-        else:
-          if currentLine.len > 0:
-            currentLine.add ", "
-          currentLine.add req
-      
-      if currentLine.len > 0:
-        echo " ".repeat(maxPkgNameDisplayWidth + maxVersionDisplayWidth + 3), currentLine
-    
-    # Show reverse dependencies indented underneath - UPDATED to group by package name
-    if pkg.reverseDependencies.len > 0:
-      var depStr = "Required by: "
-      
-      # Group dependencies by package name
-      var depGroups = initTable[string, seq[Version]]()
-      for revDep in pkg.reverseDependencies:
-        var depName = revDep[0].formatPkgName()
-        
-        if not depGroups.hasKey(depName):
-          depGroups[depName] = @[]
-        depGroups[depName].add(revDep[1])
-      
-      var depNames = toSeq(depGroups.keys)
-      depNames.sort()
-      
-      # Format each dependency group
-      var currentLine = depStr
-      var lineLen = depStr.len
-      
-      for i, depName in depNames:
-        var versions = depGroups[depName]
-        
-        # Sort versions in descending order
-        versions.sort(proc(a, b: Version): int = 
-          if a > b: -1
-          elif a < b: 1
-          else: 0
-        )
-        
-        # Format versions as a compact list
-        var versionStr = ""
-        if versions.len == 1:
-          versionStr = $versions[0].version
-        else:
-          versionStr = "v(" & versions.mapIt($it.version).join(", ") & ")"
-        
-        let depEntry = depName & " " & versionStr
-        
-        if i > 0:
-          if lineLen + 2 + depEntry.len > 80:
-            echo " ".repeat(maxPkgNameDisplayWidth + maxVersionDisplayWidth + 3), currentLine
-            currentLine = "            " & depEntry
-            lineLen = 12 + depEntry.len
-          else:
-            currentLine.add ", " & depEntry
-            lineLen += 2 + depEntry.len
-        else:
-          currentLine.add depEntry
-          lineLen += depEntry.len
-      
-      echo " ".repeat(maxPkgNameDisplayWidth + maxVersionDisplayWidth + 3), currentLine
-
-proc dumpPackageVersionTable*(pkg: PackageInfo, pkgVersionTable: Table[string, PackageVersions], options: Options, nimBin: Option[string]) =
-  # Display header
-  echo "PACKAGE".alignLeft(maxPkgNameDisplayWidth), "VERSION".alignLeft(maxVersionDisplayWidth), "REQUIREMENTS"
-  echo "-".repeat(maxPkgNameDisplayWidth + maxVersionDisplayWidth + 4)
-  
-  var sortedPackages = toSeq(pkgVersionTable.keys)
-  sortedPackages.sort()
-  
-  if pkg.basicInfo.name in sortedPackages:
-    sortedPackages.delete(sortedPackages.find(pkg.basicInfo.name))
-    sortedPackages.insert(pkg.basicInfo.name, 0)
-  
-  # Display each package and its versions
-  for pkgName in sortedPackages:
-    let pkgVersions = pkgVersionTable[pkgName]
-    var isFirstVersion = true
-    
-    # Sort versions in descending order (newest first)
-    var sortedVersions = pkgVersions.versions
-    sortedVersions.sort(proc(a, b: PackageMinimalInfo): int = 
-      if a.version > b.version: -1
-      elif a.version < b.version: 1
-      else: 0
-    )
-    
-    for version in sortedVersions:
-      # Format package name - extract repo name for GitHub URLs
-      var displayName = formatPkgName(pkgName)
-      
-      # Only show package name for first version
-      let name = if isFirstVersion: displayName else: ""
-      let rootMarker = if version.isRoot: "*" else: " "
-      
-      # Format requirements
-      var reqStr = ""
-      for i, req in version.requires:
-        if i > 0: reqStr.add ", "
-        
-        var reqName = formatPkgName(req.name)
-        
-        reqStr.add reqName
-        if req.ver.kind != verAny:
-          reqStr.add " " & $req.ver
-      
-      # Display version line
-      echo rootMarker, " ", 
-           name.alignLeft(maxPkgNameDisplayWidth - 1), 
-           $version.version.version.alignLeft(maxVersionDisplayWidth), 
-           if reqStr.len > 0: reqStr.splitLines()[0] else: ""
-      
-      # If requirements were long, display them on additional indented lines
-      if reqStr.len > 0 and (reqStr.contains('\n') or reqStr.len > 80):
-        let lines = reqStr.split(", ")
-        var currentLine = ""
-        for i, req in lines:
-          if currentLine.len + req.len + 2 > 80:  # +2 for ", "
-            if currentLine.len > 0:
-              echo " ".repeat(maxPkgNameDisplayWidth + maxVersionDisplayWidth + 3), currentLine
-            currentLine = req
-          else:
-            if currentLine.len > 0:
-              currentLine.add ", "
-            currentLine.add req
-        
-        if currentLine.len > 0:
-          echo " ".repeat(maxPkgNameDisplayWidth + maxVersionDisplayWidth + 3), currentLine
-      
-      isFirstVersion = false
-
-proc dumpPackageVersionTable*(pkg: PackageInfo, pkgList: seq[PackageInfo], options: Options, nimBin: Option[string]) =
-  let pkgVersionTable = getPkgVersionTable(pkg, pkgList, options, nimBin)
-  dumpPackageVersionTable(pkg, pkgVersionTable, options, nimBin)
-
-proc debugSATResult*(options: Options, calledFrom: string) =
-  let satResult = options.satResult
-  let color = "\e[32m"
-  let reset = "\e[0m"
-  echo "=== DEBUG SAT RESULT ==="
-  echo "Called from: ", calledFrom
-  echo "--------------------------------"
-  echo color, "Pass: ", reset, satResult.pass
-  if satResult.nimResolved.pkg.isSome:
-    echo color, "Selected Nim: ", reset, satResult.nimResolved.pkg.get.basicInfo.name, " ", satResult.nimResolved.version
-  else:
-    echo "No Nim selected"
-  echo color, "Bootstrap Nim: ", reset, "isSet: ", satResult.bootstrapNim.nimResolved.pkg.isSome, " version: ", satResult.bootstrapNim.nimResolved.version
-
-  let pkgsWithErrors = satResult.pkgs.toSeq.filterIt(it.declarativeParserErrors.len > 0)
-  if pkgsWithErrors.len > 0:
-    echo color, "Declarative parser errors: ", reset
-    for pkg in pkgsWithErrors:
-      echo "  ", pkg.basicInfo.name, " ", pkg.basicInfo.version, ": ", pkg.declarativeParserErrors
-
-  if satResult.rootPackage.hasLockFile(options):
-    echo "Root package has lock file: ", satResult.rootPackage.myPath.parentDir() / "nimble.lock"
-  else:
-    echo "Root package does not have lock file"
-  echo color, "Root package: ", reset, satResult.rootPackage.basicInfo.name, " ", satResult.rootPackage.basicInfo.version, " ", satResult.rootPackage.myPath
-  echo color, "Root requires: ", reset, satResult.rootPackage.requires.mapIt(it.name & " " & $it.ver)
-  echo color, "Solved packages: ", reset, satResult.solvedPkgs.mapIt(it.pkgName & " " & $it.version & " " & $it.deps.mapIt(it.pkgName))
-  echo color, "Solution as Packages Info: ", reset, satResult.pkgs.mapIt(it.basicInfo.name & " " & $it.basicInfo.version)
-  if options.action.typ == actionUpgrade:
-    echo color, "Upgrade versions: ", reset, options.action.packages.mapIt(it.name & " " & $it.ver)
-    echo color, "RESULT REVISIONS ", reset, satResult.pkgs.mapIt(it.basicInfo.name & " " & $it.metaData.vcsRevision)
-    echo color, "PKG LIST REVISIONS ", reset, satResult.pkgList.mapIt(it.basicInfo.name & " " & $it.metaData.vcsRevision)
-  echo color, "Packages to install: ", reset, satResult.pkgsToInstall
-  echo color, "Installed pkgs: ", reset, satResult.pkgs.mapIt(it.basicInfo.name)
-  echo color, "Build pkgs: ", reset, satResult.buildPkgs.mapIt(it.basicInfo.name)
-  echo color, "Packages url: ", reset, satResult.pkgs.mapIt(it.metaData.url)
-  echo color, "Package list: ", reset, satResult.pkgList.mapIt(it.basicInfo.name)
-  echo color, "PkgList path: ", reset, satResult.pkgList.mapIt(it.myPath.parentDir)
-  echo color, "Nimbledir: ", reset, options.getNimbleDir()
-  echo color, "Nimble Action: ", reset, options.action.typ
-  if options.action.typ == actionDevelop:
-    echo color, "Path: ", reset, options.action.packages.mapIt(it.name)
-    echo color, "Dev actions: ", reset, options.action.devActions.mapIt(it.actionType)
-    echo color, "Dependencies: ", reset, options.action.packages.mapIt(it.name)
-    for devAction in options.action.devActions:
-      echo color, "Dev action: ", reset, devAction.actionType
-      echo color, "Argument: ", reset, devAction.argument
-  echo "--------------------------------"
-
-proc getSolvedPkg*(satResult: SATResult, pkgInfo: PackageInfo): SolvedPackage =
-  for solvedPkg in satResult.solvedPkgs:
-    if pkgInfo.basicInfo.name.toLowerAscii() == solvedPkg.pkgName.toLowerAscii(): #No need to check version as they should match by design
-      return solvedPkg
-  raise newNimbleError[NimbleError]("Package not found in solution: " & $pkgInfo.basicInfo.name & " " & $pkgInfo.basicInfo.version)
-
-proc enableFeatures*(rootPackage: var PackageInfo, options: var Options) =
-  for feature in options.features:
-    if feature in rootPackage.features:
-      rootPackage.requires &= rootPackage.features[feature]
-  for pkgName, activeFeatures in rootPackage.activeFeatures:
-    var resolvedName = pkgName[0]
-    if resolvedName.isFileURL:
-      resolvedName = extractFilePathFromURL(resolvedName).lastPathPart
-    appendGloballyActiveFeatures(resolvedName, activeFeatures)
-    # Add the feature's requires directly to the root package so the SAT solver
-    # always resolves them, regardless of which version of the dependency is picked
-    for pkg in options.filePathPkgs:
-      if cmpIgnoreCase(pkg.basicInfo.name, resolvedName) == 0:
-        for feature in activeFeatures:
-          if feature in pkg.features:
-            rootPackage.requires &= pkg.features[feature]
-        break
-
-  #If root is a development package, we need to activate it as well:
-  if rootPackage.isTopLevel(options) and ("dev" in rootPackage.features or "patch" in rootPackage.features):
-    if "dev" in rootPackage.features:
-      rootPackage.requires &= rootPackage.features["dev"]
-      appendGloballyActiveFeatures(rootPackage.basicInfo.name, @["dev"])
-    if "patch" in rootPackage.features:
-      rootPackage.requires &= rootPackage.features["patch"]
-      appendGloballyActiveFeatures(rootPackage.basicInfo.name, @["patch"])
-
-proc getSolvedPkgFromInstalledPkgs*(satResult: SATResult, solvedPkg: SolvedPackage, options: Options, vcsRevision: Sha1Hash = notSetSha1Hash): Option[PackageInfo] =
-  for pkg in satResult.pkgList:
-    if pkg.basicInfo.name == solvedPkg.pkgName and pkg.basicInfo.version == solvedPkg.version:
-      # If vcsRevision is specified (from lock file), also check that it matches
-      if vcsRevision != notSetSha1Hash and pkg.metaData.vcsRevision != vcsRevision:
-        continue
-      return some(pkg)
-  return none(PackageInfo)
-
-proc solveLockFileDeps*(satResult: var SATResult, pkgList: seq[PackageInfo], options: Options, nimBin: Option[string]) =
-  let lockFile = options.lockFile(satResult.rootPackage.myPath.parentDir())
-  let currentRequires = satResult.rootPackage.requires
-  var existingRequires = newSeq[(string, Version)]()
-  for name, dep in lockFile.getLockedDependencies.lockedDepsFor(options):
-    existingRequires.add((name, dep.version))
-
-  # Check for new requirements not in lock file
-  var shouldSolve = false
-  # Collect the names of packages being explicitly upgraded so we can skip them
-  # in the shouldSolve check. When upgrading, changed requirements for the
-  # upgraded packages are expected and should not trigger a full re-solve.
-  var upgradePkgNames: seq[string]
-  if options.action.typ == actionUpgrade:
-    for pkg in options.action.packages:
-      upgradePkgNames.add(pkg.name.resolveAlias(options).toLowerAscii())
-  for current in currentRequires:
-    let currentName = current.name.resolveAlias(options).toLowerAscii()
-    # Skip packages being explicitly upgraded — their requirements are expected to change
-    if currentName in upgradePkgNames:
-      continue
-    var found = false
-    for existing in existingRequires:
-      let existingName = existing[0].resolveAlias(options).toLowerAscii()
-      if currentName == existingName and existing[1].withinRange(current.ver):
-        found = true
-        break
-    if not found:
-      if current.name.isNim:
-        #ignore if nim wasnt present in the lock file as by default we dont save nim in the lock file
-        if not existingRequires.anyIt(it[0].isNim):
-          continue
-      shouldSolve = true
-      break
-
-  var pkgListDecl: seq[PackageInfo]
-  for pkg in pkgList:
-    try:
-      pkgListDecl.add(pkg.toRequiresInfo(options, nimBin))
-    except BabelPackageError:
-      discard # babel packages are unsupported — skip them, warning already displayed
-
-  # Skip the re-solve when running outside a project dir.
-  if not options.thereIsNimbleFile:
-    shouldSolve = false
-
-  satResult.pkgList = pkgListDecl.toHashSet()
-  if shouldSolve:
-    # Create fresh package list and solve ALL requirements
-    satResult.pkgs = solvePackages(
-      satResult.rootPackage,
-      pkgListDecl,
-      satResult.pkgsToInstall,
-      options,
-      satResult.output,
-      satResult.solvedPkgs,
-      nimBin
-    )
-    if satResult.solvedPkgs.len == 0:
-      displayError(satResult.output)
-      raise newNimbleError[NimbleError]("Couldn't find a solution for the packages.")
-  elif options.action.typ == actionUpgrade:
-    #[
-    Retrocompatibility (goes against SAT in some edge cases)
-    When upgrading dep1: Only dep1 should change, dep2 should stay at it is
-    We also need to check if the upgraded version adds or removes any other deps.
-    ]#
-    for name, dep in lockFile.getLockedDependencies.lockedDepsFor(options):
-      if name.isNim: continue
-      # Populate requirements from lock file dependencies to preserve them
-      let requirements = dep.dependencies.mapIt((name: it, ver: VersionRange(kind: verAny)))
-      let solvedPkg = SolvedPackage(pkgName: name, version: dep.version, requirements: requirements)
-      if options.action.typ == actionUpgrade:
-        if solvedPkg.pkgName in satResult.solvedPkgs.mapIt(it.pkgName):
-          satResult.solvedPkgs = satResult.solvedPkgs.filterIt(it.pkgName != name)
-          satResult.pkgs = satResult.pkgs.toSeq.filterIt(it.basicInfo.name != name).toHashSet()
-        var addedUpgradePkg = false
-        for upgradePkg in options.action.packages:
-          if upgradePkg.name == name:
-            if upgradePkg.ver.kind == verSpecial:
-              satResult.pkgsToInstall.add((name, upgradePkg.ver.spe))
-            # For verAny (no version specified), the temp SAT solve below
-            # will determine the correct version to install.
-            addedUpgradePkg = true
-        if not addedUpgradePkg:
-          for pkg in pkgListDecl.toHashSet():
-            if pkg.basicInfo.name == name and pkg.basicInfo.version == dep.version and pkg.metaData.vcsRevision == dep.vcsRevision:
-              satResult.pkgs.incl(pkg)
-              break
-        satResult.solvedPkgs.add(solvedPkg)
-      var pkgListDecl = pkgListDecl
-      for upgradePkg in options.action.packages:
-        for pkg in pkgList:
-          if pkg.basicInfo.name == upgradePkg.name:
-            pkgListDecl = pkgListDecl.filterIt(it.name != upgradePkg.name)
-            for req in satResult.rootPackage.requires.mitems:
-              if req.name == upgradePkg.name:
-                req.ver = upgradePkg.ver
-                break
-            break
-
-      var tempSatResult = initSATResult(satResult.pass)
-      var newPkgsToInstall = newSeq[(string, Version)]()
-      discard solvePackages(
-            satResult.rootPackage,
-            pkgListDecl,
-            newPkgsToInstall,
-            options,
-            tempSatResult.output,
-            tempSatResult.solvedPkgs,
-            nimBin
-          )
-      for newPkgToInstall in newPkgsToInstall:
-        if newPkgToInstall[0] notin satResult.pkgsToInstall.mapIt(it[0]):
-          satResult.pkgsToInstall.add(newPkgToInstall)
-      for solvedPkg in tempSatResult.solvedPkgs:
-        if solvedPkg.pkgName notin satResult.solvedPkgs.mapIt(it.pkgName):
-          satResult.solvedPkgs.add(solvedPkg)
-
-      for upgradePkg in options.action.packages:
-        satResult.pkgs = satResult.pkgs.toSeq.filterIt(it.basicInfo.name != upgradePkg.name).toHashSet()
-
-      var actuallyNeededDeps = initHashSet[string]()
-      for solvedPkg in tempSatResult.solvedPkgs:
-        actuallyNeededDeps.incl(solvedPkg.pkgName)
-      for upgradePkg in options.action.packages:
-        actuallyNeededDeps.incl(upgradePkg.name)
-
-      satResult.solvedPkgs = satResult.solvedPkgs.filterIt(
-        it.pkgName in actuallyNeededDeps or it.pkgName == satResult.rootPackage.basicInfo.name
-      )
-      satResult.pkgs = satResult.pkgs.toSeq.filterIt(
-        it.basicInfo.name in actuallyNeededDeps or it.basicInfo.name == satResult.rootPackage.basicInfo.name
-      ).toHashSet()
-      satResult.pkgsToInstall = satResult.pkgsToInstall.filterIt(
-        it[0] in actuallyNeededDeps
-      )
-
-      validateUpgradeCompat(satResult, satResult.solvedPkgs,
-        tempSatResult.solvedPkgs, pkgListDecl, options)
-
-  else:
-    # No new requirements and not upgrading
-    satResult.solvedPkgs = satResult.solvedPkgs.filterIt(not it.pkgName.isNim)
-    satResult.pkgsToInstall = @[]
-    satResult.pkgs.clear()
-    for name, dep in lockFile.getLockedDependencies.lockedDepsFor(options):
-      let requirements = dep.dependencies.mapIt((name: it, ver: VersionRange(kind: verAny)))
-      let solvedPkg = SolvedPackage(pkgName: name, version: dep.version, requirements: requirements)
-      satResult.solvedPkgs.add(solvedPkg)
-      options.satResult.lockFileVcsRevisions[name] = dep.vcsRevision
-      if name.isNim: continue
-      let depInfo = satResult.getSolvedPkgFromInstalledPkgs(solvedPkg, options, dep.vcsRevision)
-      if depInfo.isSome:
-        satResult.pkgs.incl(depInfo.get)
-      else:
-        satResult.pkgsToInstall.add((name, dep.version))
-
-proc solutionToFullInfo*(satResult: SATResult, options: var Options, nimBin: Option[string]) {.instrument.} =
-  if satResult.rootPackage.infoKind != pikFull and not satResult.rootPackage.basicInfo.name.isNim:
-    satResult.rootPackage = getPkgInfo(satResult.rootPackage.getNimbleFileDir, options, nimBin = nimBin).toRequiresInfo(options, nimBin = nimBin)
-    satResult.rootPackage.enableFeatures(options)
+  result = packages

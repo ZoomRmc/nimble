@@ -1,7 +1,42 @@
-
 [comment]: # (Before releasing, make sure to follow the steps in https://github.com/nim-lang/nimble/wiki/Releasing-a-new-version)
 
 # Nimble changelog
+
+## 0.26.2
+
+  - Bumped bearssl to 0.2.15 to address a certificate issue.
+  - Dependencies pinned to a commit in a lock file now reuse the cached download instead of fetching it again.
+
+## 0.26.1
+
+  - Added `--solver:pubgrub` to use PubGrub for dependency resolution; SAT remains the default. Improved PubGrub performance by parsing versions once and handling lock file pins and the preferred system Nim version within a single solve.
+  - Named package installs now resolve the requested version instead of reusing a cached checkout of another version.
+  - Fixed dependency paths for `requires` evaluated through NimScript, including declarations inside templates.
+  - Fixed `taskRequires` parsing to accept Nim identifier spelling variations and use task dependencies only from the root package.
+  - Fixed `getPaths()` and `getPathsClause()` in custom tasks, including task dependencies and paths containing spaces. Existing `nimble.paths` files are refreshed before running tasks.
+  - Fixed a crash when bootstrapping Nim with binaries built using affected Nim compiler versions.
+  - Repository detection now ignores stray `.git` and `.hg` directories that are not repositories.
+  - Added a warning when updating Nimble installs a newer copy at a different path from the running executable.
+  - Release binaries are now built with Nim 2.2.12. Linux binaries remain statically linked, and Windows binaries support long paths when enabled in Windows.
+  - Fixed shell and option injection in Git and Mercurial commands by quoting repository URLs, separating options from URL arguments, and rejecting revisions that could be interpreted as options.
+
+## 0.26.0
+
+  - **PubGrub-quality resolution errors.** When the SAT solver finds no solution, a PubGrub solver re-derives the same failure and explains it in prose instead of dumping a constraint set: *"Because every version of asyncchannels depends on chronos #b71392a (4.4.0) and every version of websock depends on chronos [4.2.0, 4.4.0), asyncchannels is incompatible with websock."* 
+  - A SAT search that exhausts its budget is no longer reported as unsatisfiable, and reporting an unsatisfiable set no longer crashes.
+  - `nimble refresh` inside a project now fetches its dependencies' repos and reports which newer versions became available; `nimble refresh -g` does that for every globally known package, and `--packageListOnly` restores the old package-list-only behaviour. There is also a `--refresh`` flag that implies the `refresh` in the current action.
+  - `nimble list` accepts package names and a version range spelled as in a requires line, e.g. `nimble list "chronos >= 4.0.4"`.
+  - `nimble install -d` with no package name installs the current project's dependencies.
+  - Numerous bug fixes and stability improvements
+              
+## 0.24.0
+
+  - The declarative parser and SAT solver are now the default and only code path. Removed the `--legacy`, `--parser` and `--solver` flags, dropped Babel support, and dissolved the transitional "vnext" implementation. (A step toward Nimble 1.0, not the finish line — PubGrub-style error reporting, `nimble fetch`, and more are still ahead.)
+  - Replaced `asyncdispatch` with Chronos, with parallel package version discovery and downloads now the default (`--discovery:sync|async` to override). Uses the `packages.nim-lang.org` CDN by default.
+  - Added `--resolver:min|max` (experimental) to select the lowest or highest compatible version, and SemVer pre-release ordering support.
+  - Major `nimble develop` overhaul fixing a large number of long-standing issues: `--with-dependencies` recursively vendors dependencies under their canonical name and vendors Nim when the lock file pins it, `nimble develop <pkg>` now works outside a project directory, and `nimble develop` with no arguments sets up all dependencies. Removed the `-g`/`--global` develop flag and the global develop file.
+  - More robust Nim installation: detects a system Nim on layouts without a `nim.nimble`, and falls back to building Nim from source when the `.tar.xz` binary can't be extracted.
+  - Numerous bug fixes and stability improvements across resolution, locking, and installation.
 
 ## 0.20.0
   - Road to Nimble 1.0: New declarative parser and SAT solver as default. Still experimental and incomplete, to enable and test it set `--parser:declarative`

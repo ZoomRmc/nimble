@@ -1,34 +1,130 @@
 {.used.}
 import unittest
-import nimblepkg/[options, downloadnim, version, declarativeparser, versiondiscovery]
+import nimblepkg/[options, downloadnim, version, declarativeparser, versiondiscovery,
+                  nimenv, packageinfotypes, packagemetadatafile]
+when not defined(windows):
+  # Only the refresh fixture below needs `forcePromptYes`, and that test is
+  # skipped on Windows; an unconditional import trips "compilation without
+  # warnings" there with [UnusedImport].
+  import nimblepkg/cli
 import std/[os, options, osproc, strutils]
 import chronos
 import testscommon
-from nimblepkg/common import cd
+from nimblepkg/common import cd, NimbleError
+
+proc serveLargeHeaders(server: StreamServer, client: StreamTransport) {.async: (raises: []).} =
+  ## `/redirect` redirects to `/nim.tar.gz`, which answers "nim!". Both send
+  ## about 10 KB of headers, past chronos's 8 KB default.
+  try:
+    let path = (await client.readLine()).split(' ')[1]
+    while (await client.readLine()).len > 0: discard
+    var padding = "Connection: close\r\n"
+    for i in 1 .. 10:
+      padding.add "X-Padding-" & $i & ": " & 'x'.repeat(1000) & "\r\n"
+    let response =
+      if path == "/redirect":
+        "HTTP/1.1 302 Found\r\nLocation: http://" & $server.localAddress() &
+          "/nim.tar.gz\r\nContent-Length: 0\r\n" & padding & "\r\n"
+      else:
+        "HTTP/1.1 200 OK\r\nContent-Length: 4\r\n" & padding & "\r\nnim!"
+    discard await client.write(response)
+    # Close only after the client hangs up. Closing first can reset the
+    # connection on Windows, and the client loses whatever it hasn't read yet.
+    discard await client.read()
+  except CatchableError:
+    discard
+  finally:
+    await client.closeWait()
 
 suite "Nim binaries":
   test "can get all releases":
     var options = initOptions()
-    let releases = getOfficialReleases(options)
+    let releases = waitFor getOfficialReleases(options)
     check releases.len > 0
+
+  test "getCsourcesInfoForNim returns pinned hash for v2.0.0":
+    # Regression for the csources bootstrap mismatch:
+    # when nimble has to build Nim from source, it must use the EXACT
+    # csources commit Nim itself was built against (recorded in Nim's
+    # `config/build_config.txt`), not csources_v2/v3 HEAD which drifts.
+    let info = waitFor getCsourcesInfoForNim(newVersion("2.0.0"))
+    check info.isSome
+    let i = info.get
+    check i.dir == "csources_v2"
+    check i.url == "https://github.com/nim-lang/csources_v2.git"
+    check i.branch == "master"
+    check i.hash == "86742fb02c6606ab01a532a0085784effb2e753e"
+
+  test "getCsourcesInfoForNim returns pinned hash for v2.2.10":
+    let info = waitFor getCsourcesInfoForNim(newVersion("2.2.10"))
+    check info.isSome
+    let i = info.get
+    check i.dir == "csources_v3"
+    check i.url == "https://github.com/nim-lang/csources_v3.git"
+    check i.hash == "eeab3ac46e93f10efda8e58c4db02b9438319d71"
+
+  test "getCsourcesInfoForNim returns none for nonexistent version":
+    let info = waitFor getCsourcesInfoForNim(newVersion("999.999.999"))
+    check info.isNone
 
   test "can download a concrete version":
     var options = initOptions()
     let version = newVersion("1.2.8")
-    let path = downloadNim(version, options)
+    let path = waitFor downloadNim(version, options)
     check path.fileExists()
+
+  test "a Nim branch that doesn't exist is reported as missing":
+    var options = initOptions()
+    var message = ""
+    try:
+      discard waitFor downloadNim(newVersion("#no-such-branch-1903"), options)
+    except NimbleError as error:
+      message = error.msg
+    check message == "Version #no-such-branch-1903 does not exist."
+
+  test "a failed Nim download says why, not that the version doesn't exist (#1903)":
+    # Through a proxy nothing listens on, the download fails before reaching
+    # GitHub, which says nothing about whether the branch exists.
+    var options = initOptions()
+    let proxy = getEnv("http_proxy")
+    putEnv("http_proxy", "http://127.0.0.1:1")
+    var message = ""
+    try:
+      discard waitFor downloadNim(newVersion("#no-such-branch-1903"), options)
+    except NimbleError as error:
+      message = error.msg
+    finally:
+      if proxy.len > 0: putEnv("http_proxy", proxy) else: delEnv("http_proxy")
+    check message.startsWith(
+      "https://github.com/nim-lang/Nim/archive/no-such-branch-1903.tar.gz: ")
+    check "does not exist" notin message
+
+  test "a Nim download works when the response headers exceed 8 KB (#1903)":
+    # GitHub sends about 5 KB of headers. While they were briefly past chronos's
+    # 8 KB default, every Nim download failed with "Could not read response
+    # headers: Buffer limit reached".
+    let server = createStreamServer(initTAddress("127.0.0.1:0"), serveLargeHeaders)
+    server.start()
+    let outputPath = getTempDir() / "nimble_test_1903_headers" / "nim.tar.gz"
+    try:
+      waitFor downloadFile("http://" & $server.localAddress() & "/redirect", outputPath)
+      check readFile(outputPath) == "nim!"
+    finally:
+      removeDir(outputPath.parentDir)
+      server.stop()
+      waitFor server.closeWait()
 
   test "can download and unzip a version. Should also compile it if the precompiled binaries are not available for the current platform":
     var options = initOptions()
     let version = newVersion("2.0.4")
-    let extractDir = downloadAndExtractNim(version, options)
+    let extractDir = waitFor downloadAndExtractNim(version, options)
     check extractDir.isSome
 
 
   test "Downloading minimal package with Nim should return all the versions":
     var options = initOptions()
     let pv = ("nim", VersionRange(kind: verAny))
-    let releases: seq[Version] = getOfficialReleases(options)
+    let releases: seq[Version] = waitFor getOfficialReleases(options)
     let nimBin = some("nim")
     let minimalPgks = waitFor downloadMinimalPackage(pv, options, nimBin)
 
@@ -37,17 +133,105 @@ suite "Nim binaries":
     for pkg in minimalPgks:
       check pkg.version in releases
 
+  test "looking up an extracted Nim matches #special requirements strictly (#1855)":
+    # Two regressions guarded here. The version derived from the directory
+    # name must survive loading a `nimblemeta.json` that has no
+    # `specialVersions` (older nimbles wrote those), or nothing in the binaries
+    # dir is ever found and `installNimFromBinariesDir` re-prompts for a
+    # download on every run. And once it IS found, a `#devel` requirement must
+    # not be satisfied by a plain release: `withinRange` allows that on purpose
+    # for post-download validation, but here it would hand back `nim-2.0.4`
+    # for `nim#devel` and never install devel at all.
+    var options = initOptions()
+    let binariesDir = getTempDir() / "nimble_test_1855_nimbinaries"
+    removeDir(binariesDir)
+    defer: removeDir(binariesDir)
+    options.nimBinariesDir = binariesDir
+
+    proc fakeNim(dirName: string): string =
+      result = binariesDir / dirName
+      createDir(result / "bin")
+      createDir(result / "lib")
+      writeFile(result / "nim.nimble", "version = \"2.0.4\"\n")
+      var metaData = initPackageMetaData()
+      metaData.url = "https://github.com/nim-lang/Nim.git"
+      saveMetaData(metaData, result, changeRoots = false)
+
+    let releaseDir = fakeNim("nim-2.0.4")
+    let develDir = fakeNim("nim-#devel")
+
+    proc lookup(ver: string): Option[PackageInfo] =
+      findNimInBinariesDir((name: "nim", ver: parseVersionRange(ver)), options)
+
+    var found = lookup("2.0.4")
+    check found.isSome
+    check found.get.myPath.parentDir == releaseDir
+    check found.get.basicInfo.version == newVersion("2.0.4")
+
+    found = lookup("#devel")
+    check found.isSome
+    check found.get.myPath.parentDir == develDir
+
+    removeDir(develDir)
+    check lookup("#devel").isNone
+    check lookup("2.0.4").isSome
+
+  test "--refresh looks past an already extracted Nim for a newer one (#1855 follow-up)":
+    # An unconstrained requirement is satisfied by whatever Nim is already in
+    # the binaries dir, and reusing it is the point of #1855. But `--refresh`
+    # means "go to the remotes", and it used to be ignored here, so a newly
+    # published release stayed invisible: 2.2.10 on disk was never upgraded.
+    when defined(windows):
+      skip() # the fixture fakes `nim` with a shell script
+    else:
+      var options = initOptions()
+      options.forcePrompts = forcePromptYes
+      let binariesDir = getTempDir() / "nimble_refresh_nimbinaries"
+      removeDir(binariesDir)
+      defer: removeDir(binariesDir)
+      options.nimBinariesDir = binariesDir
+
+      proc fakeNim(version: string, discoverable: bool) =
+        ## A directory `isNimDirProperlyExtracted` accepts, whose `bin/nim`
+        ## reports `version`. Without a `nim.nimble` the binaries-dir *lookup*
+        ## skips it while `downloadAndExtractNim` still sees it as already
+        ## extracted - which is how this test resolves a release without
+        ## downloading a toolchain.
+        let dir = binariesDir / ("nim-" & version)
+        createDir(dir / "lib")
+        createDir(dir / "bin")
+        let bin = dir / "bin" / "nim"
+        writeFile(bin, "#!/bin/sh\necho \"Nim Compiler Version " & version & " [Linux: amd64]\"\n")
+        setFilePermissions(bin, {fpUserExec, fpUserRead, fpUserWrite})
+        if discoverable:
+          writeFile(dir / "nim.nimble", "version = \"" & version & "\"\n")
+
+      let newest = (waitFor getOfficialReleases(options)).max
+      fakeNim("1.0.0", discoverable = true)    # what is already on disk
+      fakeNim($newest, discoverable = false)   # what a refresh should land on
+
+      let anyNim: PkgTuple = (name: "nim", ver: VersionRange(kind: verAny))
+
+      let reused = waitFor installNimFromBinariesDir(anyNim, options)
+      check reused.isSome
+      check reused.get().ver == newVersion("1.0.0")
+
+      options.forceFetch = true
+      let refreshed = waitFor installNimFromBinariesDir(anyNim, options)
+      check refreshed.isSome
+      check refreshed.get().ver == newest
+
   test "installNimFromBinariesDir should return the installed version":
     var options = initOptions()
     let require: PkgTuple = (name: "nim", ver: parseVersionRange("2.0.4"))
-    let nimInstalled = installNimFromBinariesDir(require, options)
+    let nimInstalled = waitFor installNimFromBinariesDir(require, options)
     check nimInstalled.isSome
     check nimInstalled.get().ver == newVersion("2.0.4")
 
   test "should be able to get the package info from the nim extracted folder":
     var options = initOptions()
     let require: PkgTuple = (name: "nim", ver: parseVersionRange("2.0.4"))
-    let nimInstalled = installNimFromBinariesDir(require, options)
+    let nimInstalled = waitFor installNimFromBinariesDir(require, options)
     check nimInstalled.isSome
     check nimInstalled.get().ver == newVersion("2.0.4")
     options.nimBin = some options.makeNimBin("nim")
@@ -91,7 +275,9 @@ suite "Nim binaries":
       projectRoot = currentSourcePath().parentDir.parentDir
       nimVersionRanges = [
         ("nim ~= 1.6.0", "1.6."),
-        ("nim ~= 2.0.0", "2.0."),
+        # Not `~= 2.0.0`: the tests above install 2.0.4, which the resolver would
+        # then reuse, and chronos >= c662a40 does not compile on Nim <= 2.0.4.
+        ("nim >= 2.0.6 & < 2.1.0", "2.0."),
         ("nim ~= 2.2.0", "2.2."),
       ]
     for (nimRange, expectedPrefix) in nimVersionRanges:

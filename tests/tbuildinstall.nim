@@ -346,3 +346,39 @@ suite "Build/Install refactor":
           hasContent = true
           break
         check not hasContent
+
+  test "installing a root builds a binary dependency with a symlinked file (#1730)":
+    # Regression test for issue #1730. The root package (buildInstall/symlinkroot)
+    # depends on a binary package, https://github.com/jmgomez/symlink_dep, whose
+    # binary imports a module through a symlink (src/shared.nim -> realmod/shared.nim).
+    # Installing the root builds that dependency in buildtemp; if symlinked files
+    # are not copied there, the build fails with "cannot open file: shared".
+    when defined(windows):
+      # git does not preserve symlinks on Windows by default, so the fixture
+      # repository can't reproduce the symlink condition there.
+      skip()
+    else:
+      cd "buildInstall/symlinkroot":
+        let (output, exitCode) = execNimbleYes("install")
+        check exitCode == QuitSuccess
+        check not output.contains("cannot open file")
+
+  test "rebuilding with a commit-pinned dependency finds its sources (#1752)":
+    # Regression test for issue #1752. A commit-pinned (special version)
+    # dependency is installed into pkgs2 on the first build. On the second build
+    # the SAT solver cannot match the special constraint against the cached
+    # normal version, so the dependency is re-routed through the install path,
+    # where packageExists read it back with the wrong package source (psLocal
+    # instead of psInstalled). getRealDir() then appended srcDir to its --path,
+    # pointing at a non-existent subdirectory, and the build failed with
+    # "cannot open file: uirelays". The build must succeed on every run.
+    cd "buildInstall/commitpinnedbuild":
+      let (output1, exitCode1) = execNimbleYes("build")
+      check exitCode1 == QuitSuccess
+      check not output1.contains("cannot open file")
+
+      # Second build re-uses the cached, installed dependency: this is what used
+      # to fail before the fix.
+      let (output2, exitCode2) = execNimbleYes("build")
+      check exitCode2 == QuitSuccess
+      check not output2.contains("cannot open file")
